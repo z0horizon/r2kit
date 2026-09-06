@@ -1,9 +1,33 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::SystemTime};
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_smithy_types::{retry::RetryConfig, timeout::TimeoutConfig};
 
-use crate::{Error, R2Config, observability};
+use crate::{
+    Error, R2Config, observability,
+    types::{BucketName, IntoBucketName},
+};
+
+/// Information about an R2 bucket returned by [`R2Client::list_buckets`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BucketInfo {
+    name: String,
+    creation_date: Option<SystemTime>,
+}
+
+impl BucketInfo {
+    /// Returns the bucket name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the bucket creation date when reported.
+    #[must_use]
+    pub const fn creation_date(&self) -> Option<SystemTime> {
+        self.creation_date
+    }
+}
 
 /// A configured Cloudflare R2 client.
 #[derive(Clone)]
@@ -87,26 +111,94 @@ impl R2Client {
         &self.inner
     }
 
+    /// Lists all buckets owned by the authenticated account.
+    pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Error> {
+        let output = self
+            .inner
+            .list_buckets()
+            .send()
+            .await
+            .map_err(|error| Error::remote("ListBuckets", &error))?;
+
+        let buckets = output
+            .buckets()
+            .iter()
+            .map(|bucket| {
+                let name = bucket.name().ok_or(Error::Service {
+                    operation: "ListBuckets",
+                })?;
+                let creation_date = bucket
+                    .creation_date()
+                    .cloned()
+                    .map(SystemTime::try_from)
+                    .transpose()
+                    .map_err(|_| Error::Service {
+                        operation: "ListBuckets",
+                    })?;
+                Ok(BucketInfo {
+                    name: name.to_owned(),
+                    creation_date,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(buckets)
+    }
+
+    /// Creates a new R2 bucket with a validated bucket name.
+    pub async fn create_bucket(&self, name: impl IntoBucketName) -> Result<Bucket, Error> {
+        let name = name.into_bucket_name()?;
+
+        self.inner
+            .create_bucket()
+            .bucket(name.as_str())
+            .send()
+            .await
+            .map_err(|error| Error::remote("CreateBucket", &error))?;
+
+        Ok(Bucket {
+            client: Arc::new(self.clone()),
+            name,
+        })
+    }
+
+    /// Deletes an empty R2 bucket.
+    pub async fn delete_bucket(&self, name: impl IntoBucketName) -> Result<(), Error> {
+        let name = name.into_bucket_name()?;
+
+        self.inner
+            .delete_bucket()
+            .bucket(name.as_str())
+            .send()
+            .await
+            .map_err(|error| Error::remote("DeleteBucket", &error))?;
+
+        Ok(())
+    }
+
+    /// Checks whether a bucket exists and is accessible.
+    pub async fn bucket_exists(&self, name: impl IntoBucketName) -> Result<bool, Error> {
+        let name = name.into_bucket_name()?;
+
+        let result = self.inner.head_bucket().bucket(name.as_str()).send().await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                if error
+                    .raw_response()
+                    .is_some_and(|response| response.status().as_u16() == 404)
+                {
+                    Ok(false)
+                } else {
+                    Err(Error::remote("HeadBucket", &error))
+                }
+            }
+        }
+    }
+
     /// Selects and validates an R2 bucket.
-    pub fn bucket(&self, name: impl Into<String>) -> Result<Bucket, Error> {
-        let name = name.into();
-        if name.len() < 3 || name.len() > 63 {
-            return Err(Error::InvalidInput {
-                field: "bucket",
-                reason: "must contain between 3 and 63 bytes",
-            });
-        }
-        if !name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-            || name.starts_with('-')
-            || name.ends_with('-')
-        {
-            return Err(Error::InvalidInput {
-                field: "bucket",
-                reason: "must use lowercase ASCII letters, digits, or interior hyphens",
-            });
-        }
+    pub fn bucket(&self, name: impl IntoBucketName) -> Result<Bucket, Error> {
+        let name = name.into_bucket_name()?;
 
         Ok(Bucket {
             client: Arc::new(self.clone()),
@@ -118,7 +210,7 @@ impl R2Client {
     ///
     /// This performs one `ListObjectsV2` request with a one-object page limit.
     /// Use [`Self::bucket`] when startup network access is not desired.
-    pub async fn validate_bucket(&self, name: impl Into<String>) -> Result<Bucket, Error> {
+    pub async fn validate_bucket(&self, name: impl IntoBucketName) -> Result<Bucket, Error> {
         let bucket = self.bucket(name)?;
         bucket.validate_access().await?;
         Ok(bucket)
@@ -129,19 +221,27 @@ impl R2Client {
 #[derive(Clone)]
 pub struct Bucket {
     pub(crate) client: Arc<R2Client>,
-    pub(crate) name: String,
+    pub(crate) name: BucketName,
 }
 
 impl fmt::Debug for Bucket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Bucket").field("name", &self.name).finish()
+        f.debug_struct("Bucket")
+            .field("name", &self.name.as_str())
+            .finish()
     }
 }
 
 impl Bucket {
-    /// Returns the bucket name.
+    /// Returns the bucket name as a string slice.
     #[must_use]
     pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// Returns the typed [`BucketName`].
+    #[must_use]
+    pub fn bucket_name(&self) -> &BucketName {
         &self.name
     }
 
@@ -154,7 +254,7 @@ impl Bucket {
         self.client
             .as_sdk()
             .list_objects_v2()
-            .bucket(&self.name)
+            .bucket(self.name.as_str())
             .max_keys(1)
             .send()
             .await

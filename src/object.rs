@@ -10,17 +10,105 @@ use aws_sdk_s3::{
     types::{Delete, ObjectIdentifier},
 };
 use aws_smithy_types::date_time::Format as DateTimeFormat;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{Stream, stream};
 use headers::Header;
 use mime::Mime;
 use oxilangtag::LanguageTag;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
-use crate::{Bucket, Error, PresignedRequest, ValidationError, validation};
+use crate::{
+    Bucket, BucketName, Error, IntoBucketName, IntoObjectKey, ObjectKey, PresignedRequest,
+    ValidationError, types,
+};
 
-const MAX_SINGLE_PUT_SIZE: u64 = validation::MAX_UPLOAD_SIZE;
+const MAX_SINGLE_PUT_SIZE: u64 = types::MAX_UPLOAD_SIZE;
 const MAX_LIST_KEYS: u16 = 1_000;
 const MAX_DELETE_KEYS: usize = 1_000;
 const MAX_OBJECT_METADATA_BYTES: usize = 8_192;
+const COPY_SOURCE_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b'?')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// Checksum algorithm for upload integrity verification.
+///
+/// R2 validates the provided checksum server-side and returns `BadDigest`
+/// (HTTP 400) when the uploaded content does not match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChecksumAlgorithm {
+    /// CRC-32 checksum.
+    Crc32,
+    /// CRC-32C (Castagnoli) checksum.
+    Crc32c,
+    /// SHA-1 digest.
+    Sha1,
+    /// SHA-256 digest.
+    Sha256,
+}
+
+impl ChecksumAlgorithm {
+    /// Returns the header name used by S3/R2 for this algorithm.
+    #[must_use]
+    pub const fn header_name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "x-amz-checksum-crc32",
+            Self::Crc32c => "x-amz-checksum-crc32c",
+            Self::Sha1 => "x-amz-checksum-sha1",
+            Self::Sha256 => "x-amz-checksum-sha256",
+        }
+    }
+
+    /// Expected byte length of the raw binary digest.
+    #[must_use]
+    pub const fn digest_length(self) -> usize {
+        match self {
+            Self::Crc32 | Self::Crc32c => 4,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
+}
+
+#[cfg(feature = "checksum")]
+pub(crate) fn compute_checksum(bytes: &[u8], algorithm: ChecksumAlgorithm) -> String {
+    match algorithm {
+        ChecksumAlgorithm::Crc32 => {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(bytes);
+            let crc = hasher.finalize();
+            STANDARD.encode(crc.to_be_bytes())
+        }
+        ChecksumAlgorithm::Crc32c => {
+            let crc = crc32c::crc32c(bytes);
+            STANDARD.encode(crc.to_be_bytes())
+        }
+        ChecksumAlgorithm::Sha1 => {
+            use sha1::Digest;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(bytes);
+            let digest = hasher.finalize();
+            STANDARD.encode(digest)
+        }
+        ChecksumAlgorithm::Sha256 => {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(bytes);
+            let digest = hasher.finalize();
+            STANDARD.encode(digest)
+        }
+    }
+}
 
 /// Typed system metadata applied when an object is created.
 ///
@@ -37,6 +125,10 @@ pub struct ObjectUploadOptions {
     content_language: Option<String>,
     expires: Option<SystemTime>,
     custom: BTreeMap<String, String>,
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+    checksum: Option<ChecksumAlgorithm>,
+    checksum_value: Option<(ChecksumAlgorithm, String)>,
 }
 
 impl ObjectUploadOptions {
@@ -51,6 +143,10 @@ impl ObjectUploadOptions {
             content_language: None,
             expires: None,
             custom: BTreeMap::new(),
+            if_match: None,
+            if_none_match: None,
+            checksum: None,
+            checksum_value: None,
         }
     }
 
@@ -90,6 +186,32 @@ impl ObjectUploadOptions {
         self.expires
     }
 
+    /// Returns the configured `If-Match` condition.
+    #[must_use]
+    pub fn if_match(&self) -> Option<&str> {
+        self.if_match.as_deref()
+    }
+
+    /// Returns the configured `If-None-Match` condition.
+    #[must_use]
+    pub fn if_none_match(&self) -> Option<&str> {
+        self.if_none_match.as_deref()
+    }
+
+    /// Returns the configured checksum algorithm.
+    #[must_use]
+    pub const fn checksum(&self) -> Option<ChecksumAlgorithm> {
+        self.checksum
+    }
+
+    /// Returns the precomputed checksum algorithm and Base64-encoded value.
+    #[must_use]
+    pub fn checksum_value(&self) -> Option<(ChecksumAlgorithm, &str)> {
+        self.checksum_value
+            .as_ref()
+            .map(|(algo, val)| (*algo, val.as_str()))
+    }
+
     /// Returns user-defined metadata without the `x-amz-meta-` prefix.
     #[must_use]
     pub const fn custom_metadata(&self) -> &BTreeMap<String, String> {
@@ -106,6 +228,10 @@ impl ObjectUploadOptions {
             && self.content_language.is_none()
             && self.expires.is_none()
             && self.custom.is_empty()
+            && self.if_match.is_none()
+            && self.if_none_match.is_none()
+            && self.checksum.is_none()
+            && self.checksum_value.is_none()
     }
 
     /// Returns a copy configured with this MIME media type.
@@ -164,6 +290,38 @@ impl ObjectUploadOptions {
         self
     }
 
+    /// Returns a copy configured with this `If-Match` condition.
+    #[must_use]
+    pub fn with_if_match(mut self, value: impl Into<String>) -> Self {
+        self.if_match = Some(value.into());
+        self
+    }
+
+    /// Returns a copy configured with this `If-None-Match` condition.
+    #[must_use]
+    pub fn with_if_none_match(mut self, value: impl Into<String>) -> Self {
+        self.if_none_match = Some(value.into());
+        self
+    }
+
+    /// Returns a copy configured with this checksum algorithm for auto-computation.
+    #[must_use]
+    pub fn with_checksum(mut self, value: ChecksumAlgorithm) -> Self {
+        self.checksum = Some(value);
+        self
+    }
+
+    /// Returns a copy configured with this precomputed checksum.
+    #[must_use]
+    pub fn with_checksum_value(
+        mut self,
+        algorithm: ChecksumAlgorithm,
+        base64_value: impl Into<String>,
+    ) -> Self {
+        self.checksum_value = Some((algorithm, base64_value.into()));
+        self
+    }
+
     pub(crate) fn content_type_value(&self) -> Option<String> {
         self.content_type.as_ref().map(ToString::to_string)
     }
@@ -188,6 +346,14 @@ impl ObjectUploadOptions {
         self.expires.map(DateTime::from)
     }
 
+    pub(crate) fn if_match_value(&self) -> Option<String> {
+        self.if_match.clone()
+    }
+
+    pub(crate) fn if_none_match_value(&self) -> Option<String> {
+        self.if_none_match.clone()
+    }
+
     pub(crate) fn custom_metadata_values(&self) -> Option<HashMap<String, String>> {
         (!self.custom.is_empty()).then(|| {
             self.custom
@@ -201,6 +367,8 @@ impl ObjectUploadOptions {
         for (field, value) in [
             ("content_disposition", self.content_disposition.as_deref()),
             ("content_encoding", self.content_encoding.as_deref()),
+            ("if_match", self.if_match.as_deref()),
+            ("if_none_match", self.if_none_match.as_deref()),
         ] {
             if let Some(value) = value {
                 validate_metadata_header(field, value)?;
@@ -208,6 +376,22 @@ impl ObjectUploadOptions {
         }
         if let Some(value) = self.content_language.as_deref() {
             validate_content_language(value)?;
+        }
+        if let Some((algorithm, base64_val)) = &self.checksum_value {
+            let decoded = STANDARD
+                .decode(base64_val)
+                .map_err(|_| Error::InvalidInput {
+                    field: "checksum",
+                    reason: "must be canonical Base64",
+                })?;
+            if decoded.len() != algorithm.digest_length()
+                || STANDARD.encode(&decoded) != *base64_val
+            {
+                return Err(Error::InvalidInput {
+                    field: "checksum",
+                    reason: "checksum digest length or encoding does not match algorithm",
+                });
+            }
         }
 
         let mut total_bytes = self
@@ -264,6 +448,10 @@ pub struct ObjectUploadOptionsBuilder {
     content_language: Option<String>,
     expires: Option<SystemTime>,
     custom: BTreeMap<String, String>,
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+    checksum: Option<ChecksumAlgorithm>,
+    checksum_value: Option<(ChecksumAlgorithm, String)>,
 }
 
 impl ObjectUploadOptionsBuilder {
@@ -316,6 +504,38 @@ impl ObjectUploadOptionsBuilder {
         self
     }
 
+    /// Sets the `If-Match` condition requiring the object's current ETag to match.
+    #[must_use]
+    pub fn if_match(mut self, value: impl Into<String>) -> Self {
+        self.if_match = Some(value.into());
+        self
+    }
+
+    /// Sets the `If-None-Match` condition (e.g. `"*"` to prevent overwriting existing objects).
+    #[must_use]
+    pub fn if_none_match(mut self, value: impl Into<String>) -> Self {
+        self.if_none_match = Some(value.into());
+        self
+    }
+
+    /// Sets the checksum algorithm for client-side auto-computation on upload.
+    #[must_use]
+    pub fn checksum(mut self, value: ChecksumAlgorithm) -> Self {
+        self.checksum = Some(value);
+        self
+    }
+
+    /// Sets a precomputed Base64 checksum value for upload verification.
+    #[must_use]
+    pub fn checksum_value(
+        mut self,
+        algorithm: ChecksumAlgorithm,
+        base64_value: impl Into<String>,
+    ) -> Self {
+        self.checksum_value = Some((algorithm, base64_value.into()));
+        self
+    }
+
     /// Finishes the immutable upload metadata value.
     #[must_use]
     pub fn build(self) -> ObjectUploadOptions {
@@ -327,6 +547,10 @@ impl ObjectUploadOptionsBuilder {
             content_language: self.content_language,
             expires: self.expires,
             custom: self.custom,
+            if_match: self.if_match,
+            if_none_match: self.if_none_match,
+            checksum: self.checksum,
+            checksum_value: self.checksum_value,
         }
     }
 }
@@ -517,6 +741,27 @@ impl fmt::Debug for DownloadedObject {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PutObjectResult {
     etag: Option<String>,
+}
+
+/// Result metadata for a server-side object copy.
+#[derive(Clone, Debug)]
+pub struct CopyObjectResult {
+    etag: Option<String>,
+    last_modified: Option<SystemTime>,
+}
+
+impl CopyObjectResult {
+    /// Returns the ETag of the copied object, when R2 supplied one.
+    #[must_use]
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+
+    /// Returns the creation time of the copied object, when R2 supplied one.
+    #[must_use]
+    pub const fn last_modified(&self) -> Option<SystemTime> {
+        self.last_modified
+    }
 }
 
 impl PutObjectResult {
@@ -762,7 +1007,7 @@ impl ListObjectsBuilder {
             .into());
         }
         if let Some(prefix) = self.prefix.as_deref() {
-            validation::validate_prefix(prefix)?;
+            types::validate_prefix(prefix)?;
         }
         if self.delimiter.as_ref().is_some_and(String::is_empty) {
             return Err(Error::InvalidInput {
@@ -773,7 +1018,7 @@ impl ListObjectsBuilder {
         if self
             .delimiter
             .as_ref()
-            .is_some_and(|delimiter| delimiter.len() > validation::MAX_KEY_BYTES)
+            .is_some_and(|delimiter| delimiter.len() > types::MAX_KEY_BYTES)
         {
             return Err(Error::InvalidInput {
                 field: "delimiter",
@@ -796,7 +1041,7 @@ impl ListObjectsBuilder {
             .client
             .as_sdk()
             .list_objects_v2()
-            .bucket(&self.bucket.name)
+            .bucket(self.bucket.name.as_str())
             .set_prefix(self.prefix)
             .set_delimiter(self.delimiter)
             .max_keys(i32::from(self.limit))
@@ -881,22 +1126,551 @@ impl ListObjectsBuilder {
     }
 }
 
+/// A byte range for partial object downloads.
+///
+/// R2 supports single byte ranges only. Multi-range requests are not supported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ByteRange {
+    /// Download bytes from `start` to `end` inclusive (e.g. `bytes=0-1023`).
+    Bounded(u64, u64),
+    /// Download from `offset` to end of object (e.g. `bytes=500-`).
+    From(u64),
+    /// Download the last `n` bytes (e.g. `bytes=-500`).
+    Suffix(u64),
+}
+
+impl ByteRange {
+    /// Formats this byte range as a standard HTTP `Range` header value.
+    #[must_use]
+    pub fn as_header_value(&self) -> String {
+        match self {
+            Self::Bounded(start, end) => format!("bytes={start}-{end}"),
+            Self::From(offset) => format!("bytes={offset}-"),
+            Self::Suffix(length) => format!("bytes=-{length}"),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Bounded(start, end) if start > end => Err(Error::InvalidInput {
+                field: "range",
+                reason: "start must not exceed end",
+            }),
+            Self::Suffix(0) => Err(Error::InvalidInput {
+                field: "range",
+                reason: "suffix length must be greater than zero",
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Strategy for copying metadata during a server-side object copy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataDirective {
+    /// Copy the source object's metadata (default).
+    #[default]
+    Copy,
+    /// Replace the source object's metadata with newly specified metadata.
+    Replace,
+}
+
+impl MetadataDirective {
+    pub(crate) const fn as_sdk_directive(self) -> aws_sdk_s3::types::MetadataDirective {
+        match self {
+            Self::Copy => aws_sdk_s3::types::MetadataDirective::Copy,
+            Self::Replace => aws_sdk_s3::types::MetadataDirective::Replace,
+        }
+    }
+}
+
+/// Builder for configuring a single-object download.
+#[derive(Clone, Debug)]
+pub struct GetObjectBuilder {
+    bucket: Bucket,
+    key: Result<ObjectKey, Error>,
+    range: Option<ByteRange>,
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+    if_modified_since: Option<SystemTime>,
+    if_unmodified_since: Option<SystemTime>,
+}
+
+impl GetObjectBuilder {
+    pub(crate) fn new(bucket: Bucket, key: impl IntoObjectKey) -> Self {
+        Self {
+            bucket,
+            key: key.into_object_key(),
+            range: None,
+            if_match: None,
+            if_none_match: None,
+            if_modified_since: None,
+            if_unmodified_since: None,
+        }
+    }
+
+    /// Sets a byte range for partial download.
+    #[must_use]
+    pub fn range(mut self, value: ByteRange) -> Self {
+        self.range = Some(value);
+        self
+    }
+
+    /// Sets an `If-Match` condition requiring the ETag to match.
+    #[must_use]
+    pub fn if_match(mut self, value: impl Into<String>) -> Self {
+        self.if_match = Some(value.into());
+        self
+    }
+
+    /// Sets an `If-None-Match` condition requiring the ETag not to match.
+    #[must_use]
+    pub fn if_none_match(mut self, value: impl Into<String>) -> Self {
+        self.if_none_match = Some(value.into());
+        self
+    }
+
+    /// Sets an `If-Modified-Since` condition.
+    #[must_use]
+    pub fn if_modified_since(mut self, value: SystemTime) -> Self {
+        self.if_modified_since = Some(value);
+        self
+    }
+
+    /// Sets an `If-Unmodified-Since` condition.
+    #[must_use]
+    pub fn if_unmodified_since(mut self, value: SystemTime) -> Self {
+        self.if_unmodified_since = Some(value);
+        self
+    }
+
+    /// Sends the GET request to R2.
+    pub async fn send(self) -> Result<DownloadedObject, Error> {
+        let key = self.key?;
+        if let Some(range) = &self.range {
+            range.validate()?;
+        }
+        if self.if_match.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "if_match",
+                reason: "must not be empty",
+            });
+        }
+        if self.if_none_match.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "if_none_match",
+                reason: "must not be empty",
+            });
+        }
+
+        let mut req = self
+            .bucket
+            .client
+            .as_sdk()
+            .get_object()
+            .bucket(self.bucket.name.as_str())
+            .key(key.as_str());
+
+        if let Some(range) = self.range {
+            req = req.range(range.as_header_value());
+        }
+        if let Some(if_match) = self.if_match {
+            req = req.if_match(if_match);
+        }
+        if let Some(if_none_match) = self.if_none_match {
+            req = req.if_none_match(if_none_match);
+        }
+        if let Some(if_modified_since) = self.if_modified_since {
+            req = req.if_modified_since(DateTime::from(if_modified_since));
+        }
+        if let Some(if_unmodified_since) = self.if_unmodified_since {
+            req = req.if_unmodified_since(DateTime::from(if_unmodified_since));
+        }
+
+        let output = req.send().await.map_err(|error| {
+            if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 404)
+            {
+                Error::NotFound
+            } else if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 304)
+            {
+                Error::NotModified
+            } else if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 412)
+            {
+                Error::PreconditionFailed
+            } else {
+                Error::remote("GetObject", &error)
+            }
+        })?;
+
+        let metadata = ObjectMetadata {
+            size: non_negative_size(output.content_length, "GetObject")?,
+            etag: output.e_tag,
+            content_type: output.content_type,
+            cache_control: output.cache_control,
+            content_disposition: output.content_disposition,
+            content_encoding: output.content_encoding,
+            content_language: output.content_language,
+            expires: optional_http_date(output.expires_string.as_deref(), "GetObject")?,
+            last_modified: optional_system_time(output.last_modified, "GetObject")?,
+            custom: output.metadata.unwrap_or_default().into_iter().collect(),
+        };
+        Ok(DownloadedObject {
+            metadata,
+            body: output.body,
+        })
+    }
+}
+
+/// Builder for fetching object metadata with optional conditions.
+#[derive(Clone, Debug)]
+pub struct HeadObjectBuilder {
+    bucket: Bucket,
+    key: Result<ObjectKey, Error>,
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+    if_modified_since: Option<SystemTime>,
+    if_unmodified_since: Option<SystemTime>,
+}
+
+impl HeadObjectBuilder {
+    pub(crate) fn new(bucket: Bucket, key: impl IntoObjectKey) -> Self {
+        Self {
+            bucket,
+            key: key.into_object_key(),
+            if_match: None,
+            if_none_match: None,
+            if_modified_since: None,
+            if_unmodified_since: None,
+        }
+    }
+
+    /// Sets an `If-Match` condition requiring the ETag to match.
+    #[must_use]
+    pub fn if_match(mut self, value: impl Into<String>) -> Self {
+        self.if_match = Some(value.into());
+        self
+    }
+
+    /// Sets an `If-None-Match` condition requiring the ETag not to match.
+    #[must_use]
+    pub fn if_none_match(mut self, value: impl Into<String>) -> Self {
+        self.if_none_match = Some(value.into());
+        self
+    }
+
+    /// Sets an `If-Modified-Since` condition.
+    #[must_use]
+    pub fn if_modified_since(mut self, value: SystemTime) -> Self {
+        self.if_modified_since = Some(value);
+        self
+    }
+
+    /// Sets an `If-Unmodified-Since` condition.
+    #[must_use]
+    pub fn if_unmodified_since(mut self, value: SystemTime) -> Self {
+        self.if_unmodified_since = Some(value);
+        self
+    }
+
+    /// Sends the HEAD request to R2.
+    pub async fn send(self) -> Result<ObjectMetadata, Error> {
+        let key = self.key?;
+        if self.if_match.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "if_match",
+                reason: "must not be empty",
+            });
+        }
+        if self.if_none_match.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "if_none_match",
+                reason: "must not be empty",
+            });
+        }
+
+        let mut req = self
+            .bucket
+            .client
+            .as_sdk()
+            .head_object()
+            .bucket(self.bucket.name.as_str())
+            .key(key.as_str());
+
+        if let Some(if_match) = self.if_match {
+            req = req.if_match(if_match);
+        }
+        if let Some(if_none_match) = self.if_none_match {
+            req = req.if_none_match(if_none_match);
+        }
+        if let Some(if_modified_since) = self.if_modified_since {
+            req = req.if_modified_since(DateTime::from(if_modified_since));
+        }
+        if let Some(if_unmodified_since) = self.if_unmodified_since {
+            req = req.if_unmodified_since(DateTime::from(if_unmodified_since));
+        }
+
+        let output = req.send().await.map_err(|error| {
+            if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 404)
+            {
+                Error::NotFound
+            } else if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 304)
+            {
+                Error::NotModified
+            } else if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 412)
+            {
+                Error::PreconditionFailed
+            } else {
+                Error::remote("HeadObject", &error)
+            }
+        })?;
+
+        Ok(ObjectMetadata {
+            size: non_negative_size(output.content_length, "HeadObject")?,
+            etag: output.e_tag,
+            content_type: output.content_type,
+            cache_control: output.cache_control,
+            content_disposition: output.content_disposition,
+            content_encoding: output.content_encoding,
+            content_language: output.content_language,
+            expires: optional_http_date(output.expires_string.as_deref(), "HeadObject")?,
+            last_modified: optional_system_time(output.last_modified, "HeadObject")?,
+            custom: output.metadata.unwrap_or_default().into_iter().collect(),
+        })
+    }
+}
+
+/// Builder for copying an object server-side.
+#[derive(Clone, Debug)]
+pub struct CopyObjectBuilder {
+    bucket: Bucket,
+    source_key: Result<ObjectKey, Error>,
+    destination_key: Result<ObjectKey, Error>,
+    source_bucket: Option<Result<BucketName, Error>>,
+    source_if_match: Option<String>,
+    source_if_none_match: Option<String>,
+    source_if_modified_since: Option<SystemTime>,
+    source_if_unmodified_since: Option<SystemTime>,
+    metadata_directive: Option<MetadataDirective>,
+    metadata_options: Option<ObjectUploadOptions>,
+}
+
+impl CopyObjectBuilder {
+    pub(crate) fn new(
+        bucket: Bucket,
+        source_key: impl IntoObjectKey,
+        destination_key: impl IntoObjectKey,
+    ) -> Self {
+        Self {
+            bucket,
+            source_key: source_key.into_object_key(),
+            destination_key: destination_key.into_object_key(),
+            source_bucket: None,
+            source_if_match: None,
+            source_if_none_match: None,
+            source_if_modified_since: None,
+            source_if_unmodified_since: None,
+            metadata_directive: None,
+            metadata_options: None,
+        }
+    }
+
+    /// Sets a different source bucket within the same account (cross-bucket copy).
+    #[must_use]
+    pub fn source_bucket(mut self, value: impl IntoBucketName) -> Self {
+        self.source_bucket = Some(value.into_bucket_name());
+        self
+    }
+
+    /// Sets a condition requiring the source object ETag to match.
+    #[must_use]
+    pub fn source_if_match(mut self, value: impl Into<String>) -> Self {
+        self.source_if_match = Some(value.into());
+        self
+    }
+
+    /// Sets a condition requiring the source object ETag not to match.
+    #[must_use]
+    pub fn source_if_none_match(mut self, value: impl Into<String>) -> Self {
+        self.source_if_none_match = Some(value.into());
+        self
+    }
+
+    /// Sets a condition requiring the source object to be modified since the time.
+    #[must_use]
+    pub fn source_if_modified_since(mut self, value: SystemTime) -> Self {
+        self.source_if_modified_since = Some(value);
+        self
+    }
+
+    /// Sets a condition requiring the source object to be unmodified since the time.
+    #[must_use]
+    pub fn source_if_unmodified_since(mut self, value: SystemTime) -> Self {
+        self.source_if_unmodified_since = Some(value);
+        self
+    }
+
+    /// Sets the metadata copy directive (`COPY` or `REPLACE`).
+    #[must_use]
+    pub fn metadata_directive(mut self, value: MetadataDirective) -> Self {
+        self.metadata_directive = Some(value);
+        self
+    }
+
+    /// Sets the replacement metadata when `metadata_directive` is `REPLACE`.
+    #[must_use]
+    pub fn upload_options(mut self, options: ObjectUploadOptions) -> Self {
+        self.metadata_options = Some(options);
+        self
+    }
+
+    /// Sends the CopyObject request to R2.
+    pub async fn send(self) -> Result<CopyObjectResult, Error> {
+        let source_key = self.source_key?;
+        let destination_key = self.destination_key?;
+        let source_bucket = match self.source_bucket {
+            Some(res) => Some(res?),
+            None => None,
+        };
+        if self.source_if_match.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "source_if_match",
+                reason: "must not be empty",
+            });
+        }
+        if self
+            .source_if_none_match
+            .as_ref()
+            .is_some_and(String::is_empty)
+        {
+            return Err(Error::InvalidInput {
+                field: "source_if_none_match",
+                reason: "must not be empty",
+            });
+        }
+        if let Some(options) = &self.metadata_options {
+            options.validate()?;
+        }
+
+        let source_bucket_name = source_bucket.as_ref().unwrap_or(&self.bucket.name);
+
+        let copy_source = format!(
+            "{}/{}",
+            source_bucket_name.as_str(),
+            utf8_percent_encode(source_key.as_str(), COPY_SOURCE_ENCODE_SET)
+        );
+
+        let mut req = self
+            .bucket
+            .client
+            .as_sdk()
+            .copy_object()
+            .bucket(self.bucket.name.as_str())
+            .key(destination_key.as_str())
+            .copy_source(copy_source);
+
+        if let Some(source_if_match) = self.source_if_match {
+            req = req.copy_source_if_match(source_if_match);
+        }
+        if let Some(source_if_none_match) = self.source_if_none_match {
+            req = req.copy_source_if_none_match(source_if_none_match);
+        }
+        if let Some(source_if_modified_since) = self.source_if_modified_since {
+            req = req.copy_source_if_modified_since(DateTime::from(source_if_modified_since));
+        }
+        if let Some(source_if_unmodified_since) = self.source_if_unmodified_since {
+            req = req.copy_source_if_unmodified_since(DateTime::from(source_if_unmodified_since));
+        }
+        if let Some(directive) = self.metadata_directive {
+            req = req.metadata_directive(directive.as_sdk_directive());
+        }
+        if let Some(options) = self.metadata_options {
+            req = req
+                .set_content_type(options.content_type_value())
+                .set_cache_control(options.cache_control_value())
+                .set_content_disposition(options.content_disposition_value())
+                .set_content_encoding(options.content_encoding_value())
+                .set_content_language(options.content_language_value())
+                .set_expires(options.expires_value())
+                .set_metadata(options.custom_metadata_values());
+        }
+
+        let output = req.send().await.map_err(|error| {
+            if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 404)
+            {
+                Error::NotFound
+            } else if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 412)
+            {
+                Error::PreconditionFailed
+            } else {
+                Error::remote("CopyObject", &error)
+            }
+        })?;
+
+        let result = output.copy_object_result;
+        let last_modified = optional_system_time(
+            result.as_ref().and_then(|value| value.last_modified),
+            "CopyObject",
+        )?;
+        Ok(CopyObjectResult {
+            etag: result.as_ref().and_then(|value| value.e_tag.clone()),
+            last_modified,
+        })
+    }
+}
+
 impl Bucket {
+    /// Returns a builder for configuring a single-object download with range or conditions.
+    #[must_use]
+    pub fn get_object(&self, key: impl IntoObjectKey) -> GetObjectBuilder {
+        GetObjectBuilder::new(self.clone(), key)
+    }
+
+    /// Returns a builder for fetching object metadata with conditions.
+    #[must_use]
+    pub fn head_object(&self, key: impl IntoObjectKey) -> HeadObjectBuilder {
+        HeadObjectBuilder::new(self.clone(), key)
+    }
+
+    /// Returns a builder for copying an object server-side with conditions or across buckets.
+    #[must_use]
+    pub fn copy_object(
+        &self,
+        source_key: impl IntoObjectKey,
+        destination_key: impl IntoObjectKey,
+    ) -> CopyObjectBuilder {
+        CopyObjectBuilder::new(self.clone(), source_key, destination_key)
+    }
+
     /// Creates a temporary signed GET request for one object.
     pub async fn presign_get(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
         expires_in: Duration,
     ) -> Result<PresignedRequest, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
-        validation::validate_expiry(expires_in)?;
+        let key = key.into_object_key()?;
+        types::validate_expiry(expires_in)?;
         let config = PresigningConfig::expires_in(expires_in).map_err(|_| Error::Presign)?;
         let signed = self
             .client
             .as_sdk()
             .get_object()
-            .bucket(&self.name)
+            .bucket(self.name.as_str())
             .key(key)
             .presigned(config)
             .await
@@ -907,7 +1681,7 @@ impl Bucket {
     /// Creates a temporary signed PUT request for one object.
     pub async fn presign_put(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
         content_length: u64,
         expires_in: Duration,
     ) -> Result<PresignedPutObject, Error> {
@@ -926,14 +1700,13 @@ impl Bucket {
     /// signature and must be replayed exactly by the uploader.
     pub async fn presign_put_with_options(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
         content_length: u64,
         expires_in: Duration,
         options: ObjectUploadOptions,
     ) -> Result<PresignedPutObject, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
-        validation::validate_expiry(expires_in)?;
+        let key = key.into_object_key()?;
+        types::validate_expiry(expires_in)?;
         options.validate()?;
         if content_length > MAX_SINGLE_PUT_SIZE {
             return Err(ValidationError::SingleUploadTooLarge {
@@ -943,11 +1716,11 @@ impl Bucket {
             .into());
         }
         let config = PresigningConfig::expires_in(expires_in).map_err(|_| Error::Presign)?;
-        let signed = self
+        let mut req = self
             .client
             .as_sdk()
             .put_object()
-            .bucket(&self.name)
+            .bucket(self.name.as_str())
             .key(key)
             .content_length(
                 i64::try_from(content_length).expect("validated single-upload length fits in i64"),
@@ -959,9 +1732,19 @@ impl Bucket {
             .set_content_language(options.content_language_value())
             .set_expires(options.expires_value())
             .set_metadata(options.custom_metadata_values())
-            .presigned(config)
-            .await
-            .map_err(|_| Error::Presign)?;
+            .set_if_match(options.if_match_value())
+            .set_if_none_match(options.if_none_match_value());
+
+        if let Some((algorithm, value)) = options.checksum_value() {
+            match algorithm {
+                ChecksumAlgorithm::Crc32 => req = req.checksum_crc32(value),
+                ChecksumAlgorithm::Crc32c => req = req.checksum_crc32_c(value),
+                ChecksumAlgorithm::Sha1 => req = req.checksum_sha1(value),
+                ChecksumAlgorithm::Sha256 => req = req.checksum_sha256(value),
+            }
+        }
+
+        let signed = req.presigned(config).await.map_err(|_| Error::Presign)?;
         Ok(PresignedPutObject {
             content_length,
             request: PresignedRequest::from_sdk(signed, expires_in)?,
@@ -971,7 +1754,7 @@ impl Bucket {
     /// Uploads an in-memory object with a single R2 request.
     pub async fn put_bytes(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
         bytes: impl Into<Vec<u8>>,
     ) -> Result<PutObjectResult, Error> {
         self.put_bytes_with_options(key, bytes, ObjectUploadOptions::default())
@@ -981,20 +1764,55 @@ impl Bucket {
     /// Uploads in-memory bytes with typed object metadata.
     pub async fn put_bytes_with_options(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
         bytes: impl Into<Vec<u8>>,
         options: ObjectUploadOptions,
     ) -> Result<PutObjectResult, Error> {
         let bytes = bytes.into();
         let content_length = bytes.len() as u64;
+
+        #[cfg(feature = "checksum")]
+        let options = if let (Some(algo), None) = (options.checksum(), options.checksum_value()) {
+            let digest = compute_checksum(&bytes, algo);
+            options.with_checksum_value(algo, digest)
+        } else {
+            options
+        };
+
+        #[cfg(not(feature = "checksum"))]
+        let options = if options.checksum().is_some() && options.checksum_value().is_none() {
+            return Err(Error::InvalidInput {
+                field: "checksum",
+                reason: "auto-computing checksums requires the 'checksum' crate feature",
+            });
+        } else {
+            options
+        };
+
         self.put_stream_with_options(key, ByteStream::from(bytes), content_length, options)
             .await
     }
 
     /// Uploads a streaming body with a declared byte length using one request.
+    ///
+    /// The declared length must match the stream exactly. This API keeps the
+    /// body out of a single application-owned `Vec`; use managed multipart for
+    /// large local files that need bounded parallelism and retries.
+    ///
+    /// ```no_run
+    /// use aws_sdk_s3::primitives::ByteStream;
+    /// use r2kit::R2Client;
+    ///
+    /// # async fn upload() -> Result<(), r2kit::Error> {
+    /// let bucket = R2Client::from_env()?.bucket("media")?;
+    /// let body = ByteStream::from_static(b"streamed body");
+    /// bucket.put_stream("incoming/body.bin", body, 13).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn put_stream(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
         body: ByteStream,
         content_length: u64,
     ) -> Result<PutObjectResult, Error> {
@@ -1005,13 +1823,12 @@ impl Bucket {
     /// Uploads a streaming body with typed object metadata.
     pub async fn put_stream_with_options(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
         body: ByteStream,
         content_length: u64,
         options: ObjectUploadOptions,
     ) -> Result<PutObjectResult, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
+        let key = key.into_object_key()?;
         options.validate()?;
         if content_length > MAX_SINGLE_PUT_SIZE {
             return Err(ValidationError::SingleUploadTooLarge {
@@ -1020,11 +1837,11 @@ impl Bucket {
             }
             .into());
         }
-        let output = self
+        let mut req = self
             .client
             .as_sdk()
             .put_object()
-            .bucket(&self.name)
+            .bucket(self.name.as_str())
             .key(key)
             .content_length(
                 i64::try_from(content_length).expect("validated single-upload length fits in i64"),
@@ -1036,102 +1853,116 @@ impl Bucket {
             .set_content_language(options.content_language_value())
             .set_expires(options.expires_value())
             .set_metadata(options.custom_metadata_values())
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| Error::remote("PutObject", &error))?;
+            .set_if_match(options.if_match_value())
+            .set_if_none_match(options.if_none_match_value());
+
+        if let Some((algorithm, value)) = options.checksum_value() {
+            match algorithm {
+                ChecksumAlgorithm::Crc32 => req = req.checksum_crc32(value),
+                ChecksumAlgorithm::Crc32c => req = req.checksum_crc32_c(value),
+                ChecksumAlgorithm::Sha1 => req = req.checksum_sha1(value),
+                ChecksumAlgorithm::Sha256 => req = req.checksum_sha256(value),
+            }
+        }
+
+        let output = req.body(body).send().await.map_err(|error| {
+            if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 412)
+            {
+                Error::PreconditionFailed
+            } else {
+                Error::remote("PutObject", &error)
+            }
+        })?;
         Ok(PutObjectResult { etag: output.e_tag })
     }
 
     /// Downloads an object as a stream.
-    pub async fn get(&self, key: impl Into<String>) -> Result<DownloadedObject, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
-        let output = self
-            .client
-            .as_sdk()
-            .get_object()
-            .bucket(&self.name)
-            .key(key)
-            .send()
+    pub async fn get(&self, key: impl IntoObjectKey) -> Result<DownloadedObject, Error> {
+        self.get_object(key).send().await
+    }
+
+    /// Downloads an object directly to a local file using streaming I/O.
+    ///
+    /// Creates or truncates the destination file. This keeps the body out of
+    /// application memory.
+    ///
+    /// ```no_run
+    /// use r2kit::R2Client;
+    ///
+    /// # async fn run() -> Result<(), r2kit::Error> {
+    /// let bucket = R2Client::from_env()?.bucket("media")?;
+    /// let metadata = bucket.download_file("video.mp4", "./video.mp4").await?;
+    /// println!("downloaded {} bytes", metadata.size());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn download_file(
+        &self,
+        key: impl IntoObjectKey,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ObjectMetadata, Error> {
+        let downloaded = self.get(key).await?;
+        let metadata = downloaded.metadata().clone();
+        let mut reader = downloaded.into_body().into_async_read();
+        let mut file = tokio::fs::File::create(path.as_ref())
             .await
-            .map_err(|error| {
-                if error
-                    .raw_response()
-                    .is_some_and(|response| response.status().as_u16() == 404)
-                {
-                    Error::NotFound
-                } else {
-                    Error::remote("GetObject", &error)
-                }
+            .map_err(|_| Error::Io {
+                operation: "download_file",
             })?;
-        let metadata = ObjectMetadata {
-            size: non_negative_size(output.content_length, "GetObject")?,
-            etag: output.e_tag,
-            content_type: output.content_type,
-            cache_control: output.cache_control,
-            content_disposition: output.content_disposition,
-            content_encoding: output.content_encoding,
-            content_language: output.content_language,
-            expires: optional_http_date(output.expires_string.as_deref(), "GetObject")?,
-            last_modified: optional_system_time(output.last_modified, "GetObject")?,
-            custom: output.metadata.unwrap_or_default().into_iter().collect(),
-        };
-        Ok(DownloadedObject {
-            metadata,
-            body: output.body,
-        })
+        tokio::io::copy(&mut reader, &mut file)
+            .await
+            .map_err(|_| Error::Io {
+                operation: "download_file",
+            })?;
+        file.sync_all().await.map_err(|_| Error::Io {
+            operation: "download_file",
+        })?;
+        Ok(metadata)
     }
 
     /// Fetches object metadata without downloading its body.
-    pub async fn head(&self, key: impl Into<String>) -> Result<ObjectMetadata, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
-        let output = self
-            .client
-            .as_sdk()
-            .head_object()
-            .bucket(&self.name)
-            .key(key)
-            .send()
-            .await
-            .map_err(|error| {
-                if error
-                    .raw_response()
-                    .is_some_and(|response| response.status().as_u16() == 404)
-                {
-                    Error::NotFound
-                } else {
-                    Error::remote("HeadObject", &error)
-                }
-            })?;
-        Ok(ObjectMetadata {
-            size: non_negative_size(output.content_length, "HeadObject")?,
-            etag: output.e_tag,
-            content_type: output.content_type,
-            cache_control: output.cache_control,
-            content_disposition: output.content_disposition,
-            content_encoding: output.content_encoding,
-            content_language: output.content_language,
-            expires: optional_http_date(output.expires_string.as_deref(), "HeadObject")?,
-            last_modified: optional_system_time(output.last_modified, "HeadObject")?,
-            custom: output.metadata.unwrap_or_default().into_iter().collect(),
-        })
+    pub async fn head(&self, key: impl IntoObjectKey) -> Result<ObjectMetadata, Error> {
+        self.head_object(key).send().await
     }
 
     /// Deletes an object. R2 treats deleting a missing key as success.
-    pub async fn delete(&self, key: impl Into<String>) -> Result<(), Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
+    pub async fn delete(&self, key: impl IntoObjectKey) -> Result<(), Error> {
+        let key = key.into_object_key()?;
         self.client
             .as_sdk()
             .delete_object()
-            .bucket(&self.name)
+            .bucket(self.name.as_str())
             .key(key)
             .send()
             .await
             .map_err(|error| Error::remote("DeleteObject", &error))?;
         Ok(())
+    }
+
+    /// Copies an object within this bucket without downloading its body.
+    ///
+    /// R2 performs the copy server-side and preserves the source metadata. Both
+    /// keys are validated before the request is sent. Use [`Bucket::copy_object`]
+    /// for cross-bucket copying, conditional copies, or metadata replacement.
+    ///
+    /// ```no_run
+    /// use r2kit::R2Client;
+    ///
+    /// # async fn copy() -> Result<(), r2kit::Error> {
+    /// let bucket = R2Client::from_env()?.bucket("media")?;
+    /// let copied = bucket.copy("original.jpg", "archive/original.jpg").await?;
+    /// println!("copied ETag: {:?}", copied.etag());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn copy(
+        &self,
+        source_key: impl IntoObjectKey,
+        destination_key: impl IntoObjectKey,
+    ) -> Result<CopyObjectResult, Error> {
+        self.copy_object(source_key, destination_key).send().await
     }
 
     /// Deletes arbitrary many keys in sequential batches of at most 1,000.
@@ -1146,15 +1977,17 @@ impl Bucket {
     ) -> Result<DeleteObjectsResult, BatchDeleteError>
     where
         I: IntoIterator<Item = K>,
-        K: Into<String>,
+        K: IntoObjectKey,
     {
-        let keys = keys.into_iter().map(Into::into).collect::<Vec<_>>();
-        for key in &keys {
-            validation::validate_key(key).map_err(|error| BatchDeleteError {
+        let mut object_keys = Vec::new();
+        for item in keys {
+            let key = item.into_object_key().map_err(|error| BatchDeleteError {
                 error,
                 partial: DeleteObjectsResult::default(),
             })?;
+            object_keys.push(key.into_string());
         }
+        let keys = object_keys;
 
         let mut result = DeleteObjectsResult::default();
         for keys in delete_batches(&keys) {
@@ -1176,7 +2009,7 @@ impl Bucket {
                 .client
                 .as_sdk()
                 .delete_objects()
-                .bucket(&self.name)
+                .bucket(self.name.as_str())
                 .delete(delete)
                 .send()
                 .await

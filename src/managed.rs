@@ -25,9 +25,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
 use crate::{
-    Bucket, CompletedObject, CompletionManifest, Error, MultipartSessionSnapshot,
+    Bucket, CompletedObject, CompletionManifest, Error, IntoObjectKey, MultipartSessionSnapshot,
     ObjectUploadOptions, PartNumber, PresignedMultipart, UploadedPart, ValidationError,
-    observability, validation,
+    observability, types,
 };
 
 const DEFAULT_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -340,7 +340,7 @@ impl ManagedMultipartBuilder {
     /// out-of-range values are rejected before file or network I/O.
     #[must_use]
     pub const fn part_size_mib(mut self, mebibytes: u64) -> Self {
-        self.part_size = validation::mebibytes(mebibytes);
+        self.part_size = types::mebibytes(mebibytes);
         self
     }
 
@@ -372,7 +372,7 @@ impl ManagedMultipartBuilder {
     /// Sets the maximum memory used by in-flight part buffers in MiB.
     #[must_use]
     pub const fn max_buffered_mib(mut self, mebibytes: u64) -> Self {
-        self.max_buffered_bytes = validation::mebibytes(mebibytes);
+        self.max_buffered_bytes = types::mebibytes(mebibytes);
         self
     }
 
@@ -486,7 +486,7 @@ impl ManagedMultipartBuilder {
     }
 
     fn validate(&self) -> Result<(), Error> {
-        validation::validate_part_size(self.part_size)?;
+        types::validate_part_size(self.part_size)?;
         if self.concurrency == 0 || self.concurrency > MAX_CONCURRENCY {
             return Err(ValidationError::ConcurrencyOutOfRange {
                 provided: self.concurrency,
@@ -689,13 +689,12 @@ impl Bucket {
     /// Starts a new managed multipart upload for a local file.
     pub fn managed_multipart(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
     ) -> Result<ManagedMultipartBuilder, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
+        let key = key.into_object_key()?;
         Ok(ManagedMultipartBuilder {
             bucket: self.clone(),
-            key,
+            key: key.into_string(),
             part_size: DEFAULT_PART_SIZE,
             concurrency: DEFAULT_CONCURRENCY,
             max_attempts: DEFAULT_MAX_ATTEMPTS,

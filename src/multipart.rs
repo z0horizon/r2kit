@@ -10,8 +10,11 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_util::{Stream, stream};
 
-use crate::{Bucket, Error, ObjectUploadOptions, ValidationError, validation};
+use crate::{
+    Bucket, Error, IntoBucketName, IntoObjectKey, ObjectUploadOptions, ValidationError, types,
+};
 
 // https://developers.cloudflare.com/r2/platform/limits/
 const MAX_MULTIPART_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024 - 5 * 1024 * 1024 * 1024;
@@ -535,14 +538,14 @@ impl fmt::Debug for MultipartSessionRecord {
 impl MultipartSessionSnapshot {
     /// Restores validated multipart session state previously returned by [`PresignedMultipart::snapshot`].
     pub fn restore(
-        bucket: impl Into<String>,
-        key: impl Into<String>,
+        bucket: impl IntoBucketName,
+        key: impl IntoObjectKey,
         upload_id: impl Into<String>,
         file_size: u64,
         part_size: u64,
     ) -> Result<Self, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
+        let bucket = bucket.into_bucket_name()?;
+        let key = key.into_object_key()?;
         MultipartPlan::new(file_size, part_size)?;
         let upload_id = upload_id.into();
         if upload_id.is_empty() {
@@ -552,8 +555,8 @@ impl MultipartSessionSnapshot {
             });
         }
         Ok(Self {
-            bucket: bucket.into(),
-            key,
+            bucket: bucket.into_string(),
+            key: key.into_string(),
             upload_id,
             file_size,
             part_size,
@@ -652,7 +655,7 @@ impl MultipartPlan {
             }
             .into());
         }
-        validation::validate_part_size(part_size)?;
+        types::validate_part_size(part_size)?;
         let part_count = file_size.div_ceil(part_size);
         if part_count > u64::from(MAX_PARTS) {
             return Err(ValidationError::TooManyParts {
@@ -821,7 +824,7 @@ impl PresignedMultipartBuilder {
     /// represented as bytes are rejected by [`Self::create`].
     #[must_use]
     pub const fn part_size_mib(mut self, mebibytes: u64) -> Self {
-        self.part_size = Some(validation::mebibytes(mebibytes));
+        self.part_size = Some(types::mebibytes(mebibytes));
         self
     }
 
@@ -918,7 +921,7 @@ impl PresignedMultipart {
         expires_in: Duration,
     ) -> Result<PresignedUploadPart, Error> {
         let content_length = self.plan.part_length(number)?;
-        validation::validate_expiry(expires_in)?;
+        types::validate_expiry(expires_in)?;
         let config = PresigningConfig::expires_in(expires_in).map_err(|_| Error::Presign)?;
         let request = self
             .bucket
@@ -1117,7 +1120,7 @@ impl PresignedMultipart {
     #[must_use]
     pub fn snapshot(&self) -> MultipartSessionSnapshot {
         MultipartSessionSnapshot {
-            bucket: self.bucket.name.clone(),
+            bucket: self.bucket.name.to_string(),
             key: self.key.clone(),
             upload_id: self.upload_id.clone(),
             file_size: self.plan.file_size,
@@ -1151,17 +1154,302 @@ impl CompletedObject {
     }
 }
 
+/// Summary of an in-progress multipart upload returned by a bucket listing.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MultipartUploadSummary {
+    key: String,
+    upload_id: String,
+    initiated: Option<SystemTime>,
+}
+
+impl MultipartUploadSummary {
+    /// Returns the target object key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the opaque upload ID assigned by R2.
+    #[must_use]
+    pub fn expose_upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    /// Returns the time when the multipart upload was initiated, if reported.
+    #[must_use]
+    pub const fn initiated(&self) -> Option<SystemTime> {
+        self.initiated
+    }
+}
+
+impl fmt::Debug for MultipartUploadSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MultipartUploadSummary")
+            .field("key", &self.key)
+            .field("upload_id", &"[REDACTED]")
+            .field("initiated", &self.initiated)
+            .finish()
+    }
+}
+
+/// One bounded page of in-progress multipart uploads.
+#[derive(Clone, Debug)]
+pub struct MultipartUploadPage {
+    uploads: Vec<MultipartUploadSummary>,
+    common_prefixes: Vec<String>,
+    next_key_marker: Option<String>,
+    next_upload_id_marker: Option<String>,
+}
+
+impl MultipartUploadPage {
+    /// Returns the in-progress uploads found in this page.
+    #[must_use]
+    pub fn uploads(&self) -> &[MultipartUploadSummary] {
+        &self.uploads
+    }
+
+    /// Returns common prefixes rolled up by the delimiter.
+    #[must_use]
+    pub fn common_prefixes(&self) -> &[String] {
+        &self.common_prefixes
+    }
+
+    /// Returns the key marker needed to request the next page.
+    #[must_use]
+    pub fn next_key_marker(&self) -> Option<&str> {
+        self.next_key_marker.as_deref()
+    }
+
+    /// Returns the upload ID marker needed to request the next page.
+    #[must_use]
+    pub fn next_upload_id_marker(&self) -> Option<&str> {
+        self.next_upload_id_marker.as_deref()
+    }
+}
+
+/// Builder for listing in-progress multipart uploads in an R2 bucket.
+#[derive(Clone, Debug)]
+pub struct ListMultipartUploadsBuilder {
+    bucket: Bucket,
+    prefix: Option<String>,
+    delimiter: Option<String>,
+    limit: u16,
+    key_marker: Option<String>,
+    upload_id_marker: Option<String>,
+}
+
+impl ListMultipartUploadsBuilder {
+    pub(crate) fn new(bucket: Bucket) -> Self {
+        Self {
+            bucket,
+            prefix: None,
+            delimiter: None,
+            limit: 1_000,
+            key_marker: None,
+            upload_id_marker: None,
+        }
+    }
+
+    /// Restricts results to keys beginning with this prefix.
+    #[must_use]
+    pub fn prefix(mut self, value: impl Into<String>) -> Self {
+        self.prefix = Some(value.into());
+        self
+    }
+
+    /// Groups keys by this delimiter and returns rolled-up common prefixes.
+    #[must_use]
+    pub fn delimiter(mut self, value: impl Into<String>) -> Self {
+        self.delimiter = Some(value.into());
+        self
+    }
+
+    /// Sets the maximum number of uploads returned, from 1 through 1,000.
+    #[must_use]
+    pub const fn limit(mut self, value: u16) -> Self {
+        self.limit = value;
+        self
+    }
+
+    /// Sets the key marker for pagination.
+    #[must_use]
+    pub fn key_marker(mut self, value: impl Into<String>) -> Self {
+        self.key_marker = Some(value.into());
+        self
+    }
+
+    /// Sets the upload ID marker for pagination.
+    #[must_use]
+    pub fn upload_id_marker(mut self, value: impl Into<String>) -> Self {
+        self.upload_id_marker = Some(value.into());
+        self
+    }
+
+    /// Validates the request and fetches one page of in-progress multipart uploads.
+    pub async fn send(self) -> Result<MultipartUploadPage, Error> {
+        if self.limit == 0 || self.limit > 1_000 {
+            return Err(ValidationError::ListLimitOutOfRange {
+                provided: self.limit,
+                min: 1,
+                max: 1_000,
+            }
+            .into());
+        }
+        if let Some(prefix) = self.prefix.as_deref() {
+            types::validate_prefix(prefix)?;
+        }
+        if self.delimiter.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "delimiter",
+                reason: "must not be empty",
+            });
+        }
+        if self
+            .delimiter
+            .as_ref()
+            .is_some_and(|delimiter| delimiter.len() > types::MAX_KEY_BYTES)
+        {
+            return Err(Error::InvalidInput {
+                field: "delimiter",
+                reason: "must not exceed 1,024 UTF-8 bytes",
+            });
+        }
+        if self.key_marker.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "key_marker",
+                reason: "must not be empty",
+            });
+        }
+        if self.upload_id_marker.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::InvalidInput {
+                field: "upload_id_marker",
+                reason: "must not be empty",
+            });
+        }
+
+        let output = self
+            .bucket
+            .client
+            .as_sdk()
+            .list_multipart_uploads()
+            .bucket(&self.bucket.name)
+            .set_prefix(self.prefix)
+            .set_delimiter(self.delimiter)
+            .max_uploads(i32::from(self.limit))
+            .set_key_marker(self.key_marker)
+            .set_upload_id_marker(self.upload_id_marker)
+            .send()
+            .await
+            .map_err(|error| Error::remote("ListMultipartUploads", &error))?;
+
+        let uploads = output
+            .uploads()
+            .iter()
+            .map(|upload| {
+                let key = upload.key().ok_or(Error::Service {
+                    operation: "ListMultipartUploads",
+                })?;
+                let upload_id = upload.upload_id().ok_or(Error::Service {
+                    operation: "ListMultipartUploads",
+                })?;
+                let initiated = upload
+                    .initiated()
+                    .cloned()
+                    .map(SystemTime::try_from)
+                    .transpose()
+                    .map_err(|_| Error::Service {
+                        operation: "ListMultipartUploads",
+                    })?;
+                Ok(MultipartUploadSummary {
+                    key: key.to_owned(),
+                    upload_id: upload_id.to_owned(),
+                    initiated,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let common_prefixes = output
+            .common_prefixes()
+            .iter()
+            .map(|prefix| {
+                prefix
+                    .prefix()
+                    .map(ToOwned::to_owned)
+                    .ok_or(Error::Service {
+                        operation: "ListMultipartUploads",
+                    })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let (next_key_marker, next_upload_id_marker) = if output.is_truncated() == Some(true) {
+            (
+                output.next_key_marker.filter(|s| !s.is_empty()),
+                output.next_upload_id_marker.filter(|s| !s.is_empty()),
+            )
+        } else {
+            (None, None)
+        };
+
+        Ok(MultipartUploadPage {
+            uploads,
+            common_prefixes,
+            next_key_marker,
+            next_upload_id_marker,
+        })
+    }
+
+    /// Streams every page of in-progress multipart uploads until R2 reports completion.
+    pub fn into_pages(self) -> impl Stream<Item = Result<MultipartUploadPage, Error>> + Send {
+        stream::try_unfold(Some(self), |state| async move {
+            let Some(builder) = state else {
+                return Ok(None);
+            };
+            let prev_key = builder.key_marker.clone();
+            let prev_upload_id = builder.upload_id_marker.clone();
+            let next_builder = builder.clone();
+            let page = builder.send().await?;
+            let next_key = page.next_key_marker.clone();
+            let next_upload_id = page.next_upload_id_marker.clone();
+
+            if (next_key.is_some() || next_upload_id.is_some())
+                && next_key == prev_key
+                && next_upload_id == prev_upload_id
+            {
+                return Err(Error::Service {
+                    operation: "ListMultipartUploads",
+                });
+            }
+
+            let state = if next_key.is_some() || next_upload_id.is_some() {
+                let mut b = next_builder;
+                b.key_marker = next_key;
+                b.upload_id_marker = next_upload_id;
+                Some(b)
+            } else {
+                None
+            };
+
+            Ok(Some((page, state)))
+        })
+    }
+}
+
 impl Bucket {
+    /// Lists in-progress multipart uploads in this bucket.
+    #[must_use]
+    pub fn list_multipart_uploads(&self) -> ListMultipartUploadsBuilder {
+        ListMultipartUploadsBuilder::new(self.clone())
+    }
+
     /// Starts configuring a presigned multipart upload for an object key.
     pub fn presigned_multipart(
         &self,
-        key: impl Into<String>,
+        key: impl IntoObjectKey,
     ) -> Result<PresignedMultipartBuilder, Error> {
-        let key = key.into();
-        validation::validate_key(&key)?;
+        let key = key.into_object_key()?;
         Ok(PresignedMultipartBuilder {
             bucket: self.clone(),
-            key,
+            key: key.into_string(),
             file_size: None,
             part_size: None,
             options: ObjectUploadOptions::default(),
@@ -1173,7 +1461,7 @@ impl Bucket {
         &self,
         snapshot: MultipartSessionSnapshot,
     ) -> Result<PresignedMultipart, Error> {
-        if snapshot.bucket != self.name {
+        if snapshot.bucket != self.name.as_str() {
             return Err(Error::InvalidInput {
                 field: "bucket",
                 reason: "snapshot belongs to another bucket",
@@ -1222,7 +1510,7 @@ mod tests {
 
     #[test]
     fn rejects_an_object_over_r2s_effective_limit() {
-        let max_part_size = validation::MAX_MULTIPART_PART_SIZE;
+        let max_part_size = types::MAX_MULTIPART_PART_SIZE;
         let result = MultipartPlan::new(MAX_MULTIPART_OBJECT_SIZE + 1, max_part_size);
         assert!(matches!(
             result,
@@ -1238,7 +1526,7 @@ mod tests {
     #[test]
     fn rejects_subsecond_presign_expiry() {
         assert!(matches!(
-            validation::validate_expiry(Duration::from_millis(999)),
+            types::validate_expiry(Duration::from_millis(999)),
             Err(Error::Validation(
                 ValidationError::PresignExpiryOutOfRange { provided, .. }
             )) if provided == Duration::from_millis(999)

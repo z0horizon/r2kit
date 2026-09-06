@@ -130,6 +130,7 @@ invariants.
 | Upload a known-length async body | `Bucket::put_stream` |
 | Download without buffering the whole object | `Bucket::get` |
 | Upload a local file with concurrency and retries | `Bucket::managed_multipart` |
+| Copy an object without downloading it | `Bucket::copy` |
 | Let a browser or mobile client upload directly | `Bucket::presigned_multipart` |
 | Resume a persisted upload session | `Bucket::resume_managed_multipart` or `resume_presigned_multipart` |
 | Verify bucket existence and list permission at startup | `R2Client::validate_bucket` or `Bucket::validate_access` |
@@ -476,11 +477,33 @@ Report vulnerabilities through GitHub's private security advisory flow. See
 
 - [Object round trip](examples/object_round_trip.rs)
 - [Managed file upload](examples/managed_upload.rs)
+- [Streaming download to a local file](examples/download_to_file.rs)
+- [Axum endpoint returning a presigned upload request](examples/presigned_upload_axum.rs)
+- [Error handling cookbook](docs/error-handling.md)
+- [Transfer limits and memory guidance](docs/limits.md)
 - [Architecture and protocol invariants](docs/design.md)
 - [API documentation](https://docs.rs/r2kit)
 
-The runnable examples require `R2_BUCKET` and `R2_KEY`. The managed upload
-example additionally accepts the local file path as its first argument.
+The runnable examples use the `R2_*` credentials described in Quick start.
+Object examples also require `R2_BUCKET` and `R2_KEY`:
+
+```sh
+cargo run --example object_round_trip
+cargo run --example managed_upload -- ./large-video.mp4
+cargo run --example download_to_file -- ./download.bin
+```
+
+`download_to_file` truncates an existing destination. The Axum example only
+requires `R2_BUCKET`; start it and request an exact-length, ten-minute upload:
+
+```sh
+cargo run --example presigned_upload_axum
+curl -X POST 'http://127.0.0.1:3000/uploads/photos/cat.jpg?content_length=12345'
+```
+
+The JSON response contains a bearer URL and all signed headers the client must
+replay exactly. A production handler must authenticate the caller, authorize
+the object key, enforce size/rate limits, and avoid logging the response.
 
 ## Compatibility and scope
 

@@ -197,4 +197,23 @@ proptest! {
         prop_assert_eq!(restored.file_size(), file_size);
         prop_assert_eq!(restored.part_size(), part_size);
     }
+
+    #[test]
+    fn byte_range_bounded_invariants(start in 0_u64..1_000_000, len in 0_u64..1_000_000) {
+        let end = start + len;
+        let range = r2kit::ByteRange::Bounded(start, end);
+        prop_assert_eq!(range.as_header_value(), format!("bytes={start}-{end}"));
+    }
+
+    #[test]
+    fn byte_range_from_invariants(offset in any::<u64>()) {
+        let range = r2kit::ByteRange::From(offset);
+        prop_assert_eq!(range.as_header_value(), format!("bytes={offset}-"));
+    }
+
+    #[test]
+    fn byte_range_suffix_invariants(length in 1_u64..=u64::MAX) {
+        let range = r2kit::ByteRange::Suffix(length);
+        prop_assert_eq!(range.as_header_value(), format!("bytes=-{length}"));
+    }
 }

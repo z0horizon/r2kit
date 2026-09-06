@@ -344,7 +344,7 @@ impl fmt::Display for ServiceError {
 impl std::error::Error for ServiceError {}
 
 /// An error returned by an `r2kit` operation.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// Client configuration was invalid.
@@ -368,6 +368,10 @@ pub enum Error {
     Remote(ServiceError),
     /// The requested R2 object does not exist.
     NotFound,
+    /// The conditional request's precondition was not met (HTTP 412).
+    PreconditionFailed,
+    /// The object has not been modified since the condition (HTTP 304).
+    NotModified,
     /// A local file operation failed. Paths are intentionally omitted.
     Io {
         /// Stable name of the file operation that failed.
@@ -390,6 +394,8 @@ impl fmt::Display for Error {
             Self::Service { operation } => write!(f, "R2 operation failed: {operation}"),
             Self::Remote(error) => error.fmt(f),
             Self::NotFound => write!(f, "R2 object was not found"),
+            Self::PreconditionFailed => write!(f, "R2 precondition was not met"),
+            Self::NotModified => write!(f, "R2 object was not modified"),
             Self::Io { operation } => write!(f, "local file operation failed: {operation}"),
             Self::Cancelled => write!(f, "managed upload was cancelled"),
             Self::Presign => write!(f, "failed to create a presigned R2 request"),

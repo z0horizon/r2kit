@@ -7,13 +7,49 @@ fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
 fn async_handles_are_send_and_sync() {
+    assert_send_sync::<r2kit::ObjectKey>();
+    assert_send_sync::<r2kit::BucketName>();
     assert_send_sync::<r2kit::R2Config>();
     assert_send_sync::<r2kit::R2ConfigBuilder>();
     assert_send_sync::<r2kit::R2Jurisdiction>();
     assert_send_sync::<r2kit::R2Client>();
     assert_send_sync::<r2kit::Bucket>();
+    assert_send_sync::<r2kit::BucketInfo>();
+    assert_send_sync::<r2kit::ManagedMultipartBuilder>();
     assert_send_sync::<r2kit::ManagedUploadCancellation>();
+    assert_send_sync::<r2kit::ManagedUploadError>();
+    assert_send_sync::<r2kit::ManagedUploadProgress>();
+    assert_send_sync::<r2kit::ManagedUploadResult>();
     assert_send_sync::<r2kit::PresignedMultipart>();
+    assert_send_sync::<r2kit::PresignedMultipartBuilder>();
+    assert_send_sync::<r2kit::CompletedObject>();
+    assert_send_sync::<r2kit::CompletionManifest>();
+    assert_send_sync::<r2kit::MultipartPartReceipt>();
+    assert_send_sync::<r2kit::MultipartSessionRecord>();
+    assert_send_sync::<r2kit::MultipartSessionSnapshot>();
+    assert_send_sync::<r2kit::PartNumber>();
+    assert_send_sync::<r2kit::ByteRange>();
+    assert_send_sync::<r2kit::ChecksumAlgorithm>();
+    assert_send_sync::<r2kit::MetadataDirective>();
+    assert_send_sync::<r2kit::GetObjectBuilder>();
+    assert_send_sync::<r2kit::HeadObjectBuilder>();
+    assert_send_sync::<r2kit::CopyObjectBuilder>();
+    assert_send_sync::<r2kit::CopyObjectResult>();
+    assert_send_sync::<r2kit::ListObjectsBuilder>();
+    assert_send_sync::<r2kit::ObjectUploadOptions>();
+    assert_send_sync::<r2kit::ObjectUploadOptionsBuilder>();
+    assert_send_sync::<r2kit::PutObjectResult>();
+    assert_send_sync::<r2kit::PresignedPutObject>();
+    assert_send_sync::<r2kit::DownloadedObject>();
+    assert_send_sync::<r2kit::ObjectMetadata>();
+    assert_send_sync::<r2kit::ObjectPage>();
+    assert_send_sync::<r2kit::ObjectSummary>();
+    assert_send_sync::<r2kit::DeleteObjectsResult>();
+    assert_send_sync::<r2kit::BatchDeleteError>();
+    assert_send_sync::<r2kit::DeleteObjectFailure>();
+    assert_send_sync::<r2kit::ListMultipartUploadsBuilder>();
+    assert_send_sync::<r2kit::MultipartUploadPage>();
+    assert_send_sync::<r2kit::MultipartUploadSummary>();
 }
 
 #[test]
@@ -35,6 +71,18 @@ fn multipart_snapshot_exposes_every_persistence_field_deliberately() {
 
     let debug = format!("{snapshot:?}");
     assert!(!debug.contains("sensitive-upload-id"));
+}
+
+#[test]
+fn multipart_snapshot_restore_validates_bucket_name() {
+    let result = MultipartSessionSnapshot::restore(
+        "INVALID.BUCKET.NAME",
+        "videos/example.mp4",
+        "sensitive-upload-id",
+        11 * 1024 * 1024,
+        5 * 1024 * 1024,
+    );
+    assert!(result.is_err());
 }
 
 #[test]

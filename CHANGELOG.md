@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Range GET with single byte ranges: `ByteRange` enum (`Bounded`, `From`, `Suffix`) and `Bucket::get_object().range(...)`.
+- Conditional operations: `If-Match`, `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` support on `GetObjectBuilder`, `HeadObjectBuilder`, `CopyObjectBuilder`, and `ObjectUploadOptions`, with HTTP 412 mapped to `Error::PreconditionFailed` and HTTP 304 mapped to `Error::NotModified`.
+- Server-side cross-bucket copy and metadata directives: `CopyObjectBuilder` with same-account `source_bucket`, conditional source checks, and `MetadataDirective` (`Copy` or `Replace`).
+- In-progress multipart upload listing: `Bucket::list_multipart_uploads()` returning `MultipartUploadPage` with secret-redacted upload IDs and sendable `.into_pages()` auto-pagination stream.
+- Client-side upload checksum verification: `ChecksumAlgorithm` (`Crc32`, `Crc32c`, `Sha1`, `Sha256`) with automatic digest computation under the `checksum` feature flag and precomputed digest validation.
+- Direct streaming download helper: `Bucket::download_file()` streaming remote bodies directly into local disk files.
+- Account-level bucket management APIs: `R2Client::create_bucket()`, `R2Client::delete_bucket()`, `R2Client::list_buckets()`, and `R2Client::bucket_exists()` with validated 3-63 character bucket names.
+- A streaming local-download example and an Axum presigned-upload example.
+- Error-handling recipes, centralized transfer limits, and runnable API documentation for all transfer workflows.
+
 ## [0.1.0] - 2026-08-25
 
 ### Added
