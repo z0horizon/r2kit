@@ -555,8 +555,8 @@ impl MultipartSessionSnapshot {
             });
         }
         Ok(Self {
-            bucket: bucket.into_string(),
-            key: key.into_string(),
+            bucket: bucket.into_inner(),
+            key: key.into_inner(),
             upload_id,
             file_size,
             part_size,
@@ -637,14 +637,14 @@ impl fmt::Debug for MultipartSessionSnapshot {
 }
 
 #[derive(Clone, Debug)]
-struct MultipartPlan {
+pub(crate) struct MultipartPlan {
     file_size: u64,
     part_size: u64,
     part_count: u16,
 }
 
 impl MultipartPlan {
-    fn new(file_size: u64, part_size: u64) -> Result<Self, Error> {
+    pub(crate) fn new(file_size: u64, part_size: u64) -> Result<Self, Error> {
         if file_size == 0 {
             return Err(ValidationError::MultipartFileSizeZero.into());
         }
@@ -671,7 +671,7 @@ impl MultipartPlan {
         })
     }
 
-    fn part_length(&self, number: PartNumber) -> Result<u64, Error> {
+    pub(crate) fn part_length(&self, number: PartNumber) -> Result<u64, Error> {
         if number.get() > self.part_count {
             return Err(Error::InvalidInput {
                 field: "part_number",
@@ -841,20 +841,18 @@ impl PresignedMultipartBuilder {
                 reason: "is required",
             })?,
         )?;
-        let output = self
+        let req = self
             .bucket
             .client
             .as_sdk()
             .create_multipart_upload()
             .bucket(&self.bucket.name)
-            .key(&self.key)
-            .set_content_type(self.options.content_type_value())
-            .set_cache_control(self.options.cache_control_value())
-            .set_content_disposition(self.options.content_disposition_value())
-            .set_content_encoding(self.options.content_encoding_value())
-            .set_content_language(self.options.content_language_value())
-            .set_expires(self.options.expires_value())
-            .set_metadata(self.options.custom_metadata_values())
+            .key(&self.key);
+        let req = self
+            .options
+            .apply_to(req)
+            .set_metadata(self.options.custom_metadata_values());
+        let output = req
             .send()
             .await
             .map_err(|error| Error::remote("CreateMultipartUpload", &error))?;
@@ -1449,7 +1447,7 @@ impl Bucket {
         let key = key.into_object_key()?;
         Ok(PresignedMultipartBuilder {
             bucket: self.clone(),
-            key: key.into_string(),
+            key: key.into_inner(),
             file_size: None,
             part_size: None,
             options: ObjectUploadOptions::default(),

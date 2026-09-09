@@ -40,22 +40,20 @@ async fn live_core_object_round_trip_and_pagination() {
     let expires = UNIX_EPOCH + Duration::from_secs(1_893_456_000);
 
     let result = async {
-        let options = ObjectUploadOptions::builder()
-            .content_type(mime::TEXT_PLAIN_UTF_8)
-            .content_disposition("attachment; filename=a.txt")
-            .content_language("en-US, vi")
-            .expires(expires)
-            .custom_metadata("test-run", "object-round-trip")
-            .custom_metadata("tenant-id", "tenant-42")
-            .build();
+        let options = ObjectUploadOptions::new()
+            .with_content_type(mime::TEXT_PLAIN_UTF_8)
+            .with_content_disposition("attachment; filename=a.txt")
+            .with_content_language("en-US, vi")
+            .with_expires(expires)
+            .with_custom_metadata("test-run", "object-round-trip")
+            .with_custom_metadata("tenant-id", "tenant-42");
         let put = bucket
             .put_bytes_with_options(&first_key, first_body.clone(), options)
             .await
             .map_err(|_| "first put failed")?;
-        let encoded_options = ObjectUploadOptions::builder()
-            .content_type(mime::TEXT_PLAIN_UTF_8)
-            .content_encoding("gzip")
-            .build();
+        let encoded_options = ObjectUploadOptions::new()
+            .with_content_type(mime::TEXT_PLAIN_UTF_8)
+            .with_content_encoding("gzip");
         bucket
             .put_bytes_with_options(&second_key, second_body.clone(), encoded_options)
             .await
@@ -171,18 +169,17 @@ async fn live_presigned_put_and_get_round_trip() {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| "failed to build HTTP client")?;
-        let options = ObjectUploadOptions::builder()
-            .content_type(mime::IMAGE_JPEG)
-            .cache_control(
+        let options = ObjectUploadOptions::new()
+            .with_content_type(mime::IMAGE_JPEG)
+            .with_cache_control(
                 CacheControl::new()
                     .with_public()
                     .with_max_age(Duration::from_secs(3_600)),
             )
-            .content_disposition("attachment; filename=presigned.bin")
-            .content_language("en-US")
-            .expires(expires)
-            .custom_metadata("upload-mode", "presigned")
-            .build();
+            .with_content_disposition("attachment; filename=presigned.bin")
+            .with_content_language("en-US")
+            .with_expires(expires)
+            .with_custom_metadata("upload-mode", "presigned");
         let put = bucket
             .presign_put_with_options(&key, body.len() as u64, Duration::from_secs(900), options)
             .await
@@ -387,9 +384,7 @@ async fn live_checksum_upload_with_auto_and_precomputed() {
 
     let result = async {
         // 1. Auto-computed SHA-256 upload
-        let sha256_options = ObjectUploadOptions::builder()
-            .checksum(ChecksumAlgorithm::Sha256)
-            .build();
+        let sha256_options = ObjectUploadOptions::new().with_checksum(ChecksumAlgorithm::Sha256);
         let put_sha256 = bucket
             .put_bytes_with_options(&sha256_key, body.clone(), sha256_options)
             .await
@@ -410,9 +405,8 @@ async fn live_checksum_upload_with_auto_and_precomputed() {
         #[cfg(not(feature = "checksum"))]
         let crc32_b64 = "dummy".to_string();
 
-        let crc32_options = ObjectUploadOptions::builder()
-            .checksum_value(ChecksumAlgorithm::Crc32, crc32_b64)
-            .build();
+        let crc32_options =
+            ObjectUploadOptions::new().with_checksum_value(ChecksumAlgorithm::Crc32, crc32_b64);
         let put_crc32 = bucket
             .put_bytes_with_options(&crc32_key, body.clone(), crc32_options)
             .await

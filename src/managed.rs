@@ -404,6 +404,176 @@ impl ManagedMultipartBuilder {
         self
     }
 
+    /// Uploads an asynchronous stream of bytes.
+    pub async fn upload_stream(
+        self,
+        reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+        file_size: u64,
+    ) -> Result<ManagedUploadResult, ManagedUploadError> {
+        self.validate().map_err(ManagedUploadError::before_start)?;
+        observability::managed_upload("start", self.part_size, self.concurrency, self.max_attempts);
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(ManagedUploadCancellation::is_cancelled)
+        {
+            return Err(ManagedUploadError::before_start(Error::Cancelled));
+        }
+
+        let session = self
+            .bucket
+            .presigned_multipart(&self.key)
+            .map_err(ManagedUploadError::before_start)?
+            .file_size(file_size)
+            .part_size(self.part_size)
+            .upload_options(self.options.clone())
+            .create()
+            .await
+            .map_err(ManagedUploadError::before_start)?;
+
+        let run = self.run_stream(reader, &session);
+        let result = match self.cancellation.as_ref() {
+            Some(cancellation) => {
+                let run = std::pin::pin!(run);
+                let cancelled = std::pin::pin!(cancellation.cancelled());
+
+                match select(run, cancelled).await {
+                    Either::Left((result, _)) => result,
+                    Either::Right(((), _)) => Err(Error::Cancelled),
+                }
+            }
+            None => run.await,
+        };
+
+        match result {
+            Ok(result) => {
+                observability::managed_upload(
+                    "complete",
+                    self.part_size,
+                    self.concurrency,
+                    self.max_attempts,
+                );
+                Ok(result)
+            }
+            Err(error) => Err(self.after_start_error(error, &session).await),
+        }
+    }
+
+    async fn run_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+        &self,
+        mut reader: R,
+        session: &PresignedMultipart,
+    ) -> Result<ManagedUploadResult, Error> {
+        let channel_size = std::cmp::max(1, (self.max_buffered_bytes / self.part_size) as usize);
+        let (tx, rx) = tokio::sync::mpsc::channel::<(PartNumber, Vec<u8>)>(channel_size);
+
+        let part_size = session.snapshot().part_size();
+        let file_size = session.snapshot().file_size();
+        let mut reader_set = tokio::task::JoinSet::new();
+        reader_set.spawn(async move {
+            let mut remaining = file_size;
+            let mut number = 1;
+            while remaining > 0 {
+                let current_part_size = remaining.min(part_size);
+                let mut buf = vec![0; current_part_size as usize];
+                if reader.read_exact(&mut buf).await.is_err() {
+                    return Err(Error::Io {
+                        operation: "read_exact",
+                    });
+                }
+                let part_number =
+                    PartNumber::try_from(number).map_err(|_| Error::InvalidInput {
+                        field: "part_number",
+                        reason: "exceeded maximum parts",
+                    })?;
+                if tx.send((part_number, buf)).await.is_err() {
+                    break;
+                }
+                remaining -= current_part_size;
+                number += 1;
+            }
+            Ok::<(), Error>(())
+        });
+
+        let client = self.bucket.client.as_sdk().clone();
+        let bucket = session.snapshot().bucket().to_owned();
+        let key = session.snapshot().key().to_owned();
+        let upload_id = session.snapshot().expose_upload_id().to_owned();
+        let max_attempts = self.max_attempts;
+        let concurrency = self.concurrency;
+        let progress = self.progress.clone();
+        let total_parts = session.part_count();
+        let total_bytes = session.snapshot().file_size();
+        let completed_parts = Arc::new(AtomicU16::new(0));
+        let transferred_bytes = Arc::new(AtomicU64::new(0));
+
+        let uploaded = stream::unfold(rx, |mut rx| async move {
+            let item = rx.recv().await;
+            item.map(|val| (val, rx))
+        })
+        .map(|(number, bytes)| {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let upload_id = upload_id.clone();
+            let completed_parts = Arc::clone(&completed_parts);
+            let transferred_bytes = Arc::clone(&transferred_bytes);
+            let progress = progress.clone();
+            async move {
+                let length = bytes.len() as u64;
+                let uploaded = upload_part_with_retry(
+                    &client,
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    number,
+                    bytes,
+                    max_attempts,
+                )
+                .await?;
+                let parts = completed_parts.fetch_add(1, Ordering::Relaxed) + 1;
+                let bytes_transferred =
+                    transferred_bytes.fetch_add(length, Ordering::Relaxed) + length;
+                if let Some(callback) = progress.as_ref() {
+                    callback(ManagedUploadProgress {
+                        completed_parts: parts,
+                        total_parts,
+                        transferred_bytes: bytes_transferred,
+                        total_bytes,
+                    });
+                }
+                Ok::<UploadedPart, Error>(uploaded)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        reader_set
+            .join_next()
+            .await
+            .expect("reader_set should contain exactly one task")
+            .map_err(|_| Error::Io {
+                operation: "reader_task_panic",
+            })??;
+
+        let mut manifest = BTreeMap::new();
+        let uploaded_count = uploaded.len() as u16;
+        for part in uploaded {
+            manifest.insert(part.part_number(), part);
+        }
+
+        let completion = CompletionManifest::try_from_parts(manifest.into_values())?;
+        let object = session.complete(completion).await?;
+        Ok(ManagedUploadResult {
+            object,
+            file_size: total_bytes,
+            part_count: total_parts,
+            uploaded_parts: uploaded_count,
+            reused_parts: 0,
+        })
+    }
+
     /// Uploads the local file, reusing validated remote parts when resuming.
     pub async fn upload_file(
         self,
@@ -552,12 +722,16 @@ impl ManagedMultipartBuilder {
         );
 
         let existing_numbers: BTreeSet<PartNumber> = manifest.keys().copied().collect();
-        let missing: Vec<PartNumber> = (1..=total_parts)
+        let missing: Vec<(PartNumber, u64)> = (1..=total_parts)
             .map(PartNumber::try_from)
             .collect::<Result<Vec<_>, Error>>()?
             .into_iter()
             .filter(|part| !existing_numbers.contains(part))
-            .collect();
+            .map(|part| {
+                let length = session.part_length(part)?;
+                Ok((part, length))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         let snapshot = session.snapshot();
         let client = self.bucket.client.as_sdk().clone();
         let concurrency = self.concurrency;
@@ -570,7 +744,7 @@ impl ManagedMultipartBuilder {
         let key = snapshot.key().to_owned();
         let upload_id = snapshot.expose_upload_id().to_owned();
 
-        let uploaded = stream::iter(missing.into_iter().map(|number| {
+        let uploaded = stream::iter(missing.into_iter().map(|(number, length)| {
             let client = client.clone();
             let path = path.clone();
             let bucket = bucket.clone();
@@ -580,7 +754,6 @@ impl ManagedMultipartBuilder {
             let transferred_bytes = Arc::clone(&transferred_bytes);
             let progress = progress.clone();
             async move {
-                let length = planned_part_length(total_bytes, part_size, number)?;
                 let bytes = read_part(&path, part_size, number, length).await?;
                 let uploaded = upload_part_with_retry(
                     &client,
@@ -694,7 +867,7 @@ impl Bucket {
         let key = key.into_object_key()?;
         Ok(ManagedMultipartBuilder {
             bucket: self.clone(),
-            key: key.into_string(),
+            key: key.into_inner(),
             part_size: DEFAULT_PART_SIZE,
             concurrency: DEFAULT_CONCURRENCY,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
@@ -926,16 +1099,6 @@ fn retry_delay(attempt: u8, retry_after: Option<Duration>, random: u64) -> Durat
 
 async fn list_uploaded_parts(session: &PresignedMultipart) -> Result<Vec<UploadedPart>, Error> {
     Ok(session.reconcile().await?.into_uploaded_parts())
-}
-
-fn planned_part_length(file_size: u64, part_size: u64, number: PartNumber) -> Result<u64, Error> {
-    let offset = u64::from(number.get() - 1)
-        .checked_mul(part_size)
-        .ok_or(Error::InvalidInput {
-            field: "part_number",
-            reason: "part offset overflowed",
-        })?;
-    Ok((file_size - offset).min(part_size))
 }
 
 #[cfg(test)]

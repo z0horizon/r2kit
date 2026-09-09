@@ -88,12 +88,6 @@ impl ObjectKey {
     pub fn into_inner(self) -> String {
         self.0
     }
-
-    /// Consumes the [`ObjectKey`], returning the inner [`String`].
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
 }
 
 fn validate_key_str(key: &str) -> Result<(), Error> {
@@ -200,12 +194,6 @@ impl BucketName {
     /// Consumes the [`BucketName`], returning the inner [`String`].
     #[must_use]
     pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Consumes the [`BucketName`], returning the inner [`String`].
-    #[must_use]
-    pub fn into_string(self) -> String {
         self.0
     }
 }

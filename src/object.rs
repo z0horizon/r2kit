@@ -22,6 +22,29 @@ use crate::{
     ValidationError, types,
 };
 
+macro_rules! map_object_error {
+    ($operation:expr, $error:expr) => {{
+        if $error
+            .raw_response()
+            .is_some_and(|response| response.status().as_u16() == 404)
+        {
+            Error::NotFound
+        } else if $error
+            .raw_response()
+            .is_some_and(|response| response.status().as_u16() == 304)
+        {
+            Error::NotModified
+        } else if $error
+            .raw_response()
+            .is_some_and(|response| response.status().as_u16() == 412)
+        {
+            Error::PreconditionFailed
+        } else {
+            Error::remote($operation, &$error)
+        }
+    }};
+}
+
 const MAX_SINGLE_PUT_SIZE: u64 = types::MAX_UPLOAD_SIZE;
 const MAX_LIST_KEYS: u16 = 1_000;
 const MAX_DELETE_KEYS: usize = 1_000;
@@ -132,22 +155,10 @@ pub struct ObjectUploadOptions {
 }
 
 impl ObjectUploadOptions {
-    /// Starts building typed upload metadata.
+    /// Creates empty upload metadata (equivalent to `Default::default()`).
     #[must_use]
-    pub const fn builder() -> ObjectUploadOptionsBuilder {
-        ObjectUploadOptionsBuilder {
-            content_type: None,
-            cache_control: None,
-            content_disposition: None,
-            content_encoding: None,
-            content_language: None,
-            expires: None,
-            custom: BTreeMap::new(),
-            if_match: None,
-            if_none_match: None,
-            checksum: None,
-            checksum_value: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Returns the configured media type.
@@ -322,28 +333,13 @@ impl ObjectUploadOptions {
         self
     }
 
-    pub(crate) fn content_type_value(&self) -> Option<String> {
-        self.content_type.as_ref().map(ToString::to_string)
-    }
-
-    pub(crate) fn cache_control_value(&self) -> Option<String> {
-        self.cache_control.as_ref().map(encode_header)
-    }
-
-    pub(crate) fn content_disposition_value(&self) -> Option<String> {
-        self.content_disposition.clone()
-    }
-
-    pub(crate) fn content_encoding_value(&self) -> Option<String> {
-        self.content_encoding.clone()
-    }
-
-    pub(crate) fn content_language_value(&self) -> Option<String> {
-        self.content_language.clone()
-    }
-
-    pub(crate) fn expires_value(&self) -> Option<DateTime> {
-        self.expires.map(DateTime::from)
+    pub(crate) fn apply_to<T: SetObjectMetadata>(&self, req: T) -> T {
+        req.set_content_type(self.content_type.as_ref().map(ToString::to_string))
+            .set_cache_control(self.cache_control.as_ref().map(encode_header))
+            .set_content_disposition(self.content_disposition.clone())
+            .set_content_encoding(self.content_encoding.clone())
+            .set_content_language(self.content_language.clone())
+            .set_expires(self.expires.map(DateTime::from))
     }
 
     pub(crate) fn if_match_value(&self) -> Option<String> {
@@ -395,11 +391,12 @@ impl ObjectUploadOptions {
         }
 
         let mut total_bytes = self
-            .content_type_value()
-            .map_or(0, |value| "content-type".len() + value.len())
-            + self
-                .cache_control_value()
-                .map_or(0, |value| "cache-control".len() + value.len())
+            .content_type
+            .as_ref()
+            .map_or(0, |value| "content-type".len() + value.to_string().len())
+            + self.cache_control.as_ref().map_or(0, |value| {
+                "cache-control".len() + encode_header(value).len()
+            })
             + self
                 .content_disposition
                 .as_ref()
@@ -438,122 +435,45 @@ impl ObjectUploadOptions {
     }
 }
 
-/// Builds typed metadata for a newly uploaded object.
-#[derive(Clone, Debug, Default)]
-pub struct ObjectUploadOptionsBuilder {
-    content_type: Option<Mime>,
-    cache_control: Option<headers::CacheControl>,
-    content_disposition: Option<String>,
-    content_encoding: Option<String>,
-    content_language: Option<String>,
-    expires: Option<SystemTime>,
-    custom: BTreeMap<String, String>,
-    if_match: Option<String>,
-    if_none_match: Option<String>,
-    checksum: Option<ChecksumAlgorithm>,
-    checksum_value: Option<(ChecksumAlgorithm, String)>,
+pub(crate) trait SetObjectMetadata {
+    fn set_content_type(self, value: Option<String>) -> Self;
+    fn set_cache_control(self, value: Option<String>) -> Self;
+    fn set_content_disposition(self, value: Option<String>) -> Self;
+    fn set_content_encoding(self, value: Option<String>) -> Self;
+    fn set_content_language(self, value: Option<String>) -> Self;
+    fn set_expires(self, value: Option<DateTime>) -> Self;
 }
 
-impl ObjectUploadOptionsBuilder {
-    /// Sets the object's MIME media type.
-    #[must_use]
-    pub fn content_type(mut self, value: Mime) -> Self {
-        self.content_type = Some(value);
-        self
-    }
-
-    /// Sets the object's typed HTTP cache policy.
-    #[must_use]
-    pub fn cache_control(mut self, value: headers::CacheControl) -> Self {
-        self.cache_control = Some(value);
-        self
-    }
-
-    /// Sets the object's content disposition.
-    #[must_use]
-    pub fn content_disposition(mut self, value: impl Into<String>) -> Self {
-        self.content_disposition = Some(value.into());
-        self
-    }
-
-    /// Sets the object's content encoding.
-    #[must_use]
-    pub fn content_encoding(mut self, value: impl Into<String>) -> Self {
-        self.content_encoding = Some(value.into());
-        self
-    }
-
-    /// Sets the object's content language.
-    #[must_use]
-    pub fn content_language(mut self, value: impl Into<String>) -> Self {
-        self.content_language = Some(value.into());
-        self
-    }
-
-    /// Sets the object's HTTP expiration time.
-    #[must_use]
-    pub fn expires(mut self, value: SystemTime) -> Self {
-        self.expires = Some(value);
-        self
-    }
-
-    /// Adds user-defined metadata without the `x-amz-meta-` prefix.
-    #[must_use]
-    pub fn custom_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.custom.insert(key.into(), value.into());
-        self
-    }
-
-    /// Sets the `If-Match` condition requiring the object's current ETag to match.
-    #[must_use]
-    pub fn if_match(mut self, value: impl Into<String>) -> Self {
-        self.if_match = Some(value.into());
-        self
-    }
-
-    /// Sets the `If-None-Match` condition (e.g. `"*"` to prevent overwriting existing objects).
-    #[must_use]
-    pub fn if_none_match(mut self, value: impl Into<String>) -> Self {
-        self.if_none_match = Some(value.into());
-        self
-    }
-
-    /// Sets the checksum algorithm for client-side auto-computation on upload.
-    #[must_use]
-    pub fn checksum(mut self, value: ChecksumAlgorithm) -> Self {
-        self.checksum = Some(value);
-        self
-    }
-
-    /// Sets a precomputed Base64 checksum value for upload verification.
-    #[must_use]
-    pub fn checksum_value(
-        mut self,
-        algorithm: ChecksumAlgorithm,
-        base64_value: impl Into<String>,
-    ) -> Self {
-        self.checksum_value = Some((algorithm, base64_value.into()));
-        self
-    }
-
-    /// Finishes the immutable upload metadata value.
-    #[must_use]
-    pub fn build(self) -> ObjectUploadOptions {
-        ObjectUploadOptions {
-            content_type: self.content_type,
-            cache_control: self.cache_control,
-            content_disposition: self.content_disposition,
-            content_encoding: self.content_encoding,
-            content_language: self.content_language,
-            expires: self.expires,
-            custom: self.custom,
-            if_match: self.if_match,
-            if_none_match: self.if_none_match,
-            checksum: self.checksum,
-            checksum_value: self.checksum_value,
+macro_rules! impl_set_object_metadata {
+    ($builder:ty) => {
+        impl SetObjectMetadata for $builder {
+            fn set_content_type(self, value: Option<String>) -> Self {
+                self.set_content_type(value)
+            }
+            fn set_cache_control(self, value: Option<String>) -> Self {
+                self.set_cache_control(value)
+            }
+            fn set_content_disposition(self, value: Option<String>) -> Self {
+                self.set_content_disposition(value)
+            }
+            fn set_content_encoding(self, value: Option<String>) -> Self {
+                self.set_content_encoding(value)
+            }
+            fn set_content_language(self, value: Option<String>) -> Self {
+                self.set_content_language(value)
+            }
+            fn set_expires(self, value: Option<DateTime>) -> Self {
+                self.set_expires(value)
+            }
         }
-    }
+    };
 }
+
+impl_set_object_metadata!(aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder);
+impl_set_object_metadata!(aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder);
+impl_set_object_metadata!(
+    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder
+);
 
 fn validate_metadata_header(field: &'static str, value: &str) -> Result<(), Error> {
     if value.is_empty() {
@@ -733,6 +653,24 @@ impl fmt::Debug for DownloadedObject {
         f.debug_struct("DownloadedObject")
             .field("metadata", &self.metadata)
             .field("body", &"ByteStream(..)")
+            .finish()
+    }
+}
+
+/// A fully downloaded object containing its metadata and body in memory.
+#[derive(Clone)]
+pub struct ObjectBytes {
+    /// The object's metadata.
+    pub metadata: ObjectMetadata,
+    /// The object's body bytes.
+    pub bytes: bytes::Bytes,
+}
+
+impl fmt::Debug for ObjectBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObjectBytes")
+            .field("metadata", &self.metadata)
+            .field("bytes", &format!("{} bytes", self.bytes.len()))
             .finish()
     }
 }
@@ -1287,26 +1225,10 @@ impl GetObjectBuilder {
             req = req.if_unmodified_since(DateTime::from(if_unmodified_since));
         }
 
-        let output = req.send().await.map_err(|error| {
-            if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 404)
-            {
-                Error::NotFound
-            } else if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 304)
-            {
-                Error::NotModified
-            } else if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 412)
-            {
-                Error::PreconditionFailed
-            } else {
-                Error::remote("GetObject", &error)
-            }
-        })?;
+        let output = req
+            .send()
+            .await
+            .map_err(|error| map_object_error!("GetObject", error))?;
 
         let metadata = ObjectMetadata {
             size: non_negative_size(output.content_length, "GetObject")?,
@@ -1415,26 +1337,10 @@ impl HeadObjectBuilder {
             req = req.if_unmodified_since(DateTime::from(if_unmodified_since));
         }
 
-        let output = req.send().await.map_err(|error| {
-            if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 404)
-            {
-                Error::NotFound
-            } else if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 304)
-            {
-                Error::NotModified
-            } else if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 412)
-            {
-                Error::PreconditionFailed
-            } else {
-                Error::remote("HeadObject", &error)
-            }
-        })?;
+        let output = req
+            .send()
+            .await
+            .map_err(|error| map_object_error!("HeadObject", error))?;
 
         Ok(ObjectMetadata {
             size: non_negative_size(output.content_length, "HeadObject")?,
@@ -1596,31 +1502,15 @@ impl CopyObjectBuilder {
             req = req.metadata_directive(directive.as_sdk_directive());
         }
         if let Some(options) = self.metadata_options {
-            req = req
-                .set_content_type(options.content_type_value())
-                .set_cache_control(options.cache_control_value())
-                .set_content_disposition(options.content_disposition_value())
-                .set_content_encoding(options.content_encoding_value())
-                .set_content_language(options.content_language_value())
-                .set_expires(options.expires_value())
+            req = options
+                .apply_to(req)
                 .set_metadata(options.custom_metadata_values());
         }
 
-        let output = req.send().await.map_err(|error| {
-            if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 404)
-            {
-                Error::NotFound
-            } else if error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 412)
-            {
-                Error::PreconditionFailed
-            } else {
-                Error::remote("CopyObject", &error)
-            }
-        })?;
+        let output = req
+            .send()
+            .await
+            .map_err(|error| map_object_error!("CopyObject", error))?;
 
         let result = output.copy_object_result;
         let last_modified = optional_system_time(
@@ -1635,10 +1525,46 @@ impl CopyObjectBuilder {
 }
 
 impl Bucket {
+    /// Presigns a DELETE request for an object.
+    pub async fn presign_delete(
+        &self,
+        key: impl IntoObjectKey,
+        expires_in: Duration,
+    ) -> Result<PresignedRequest, Error> {
+        let key = key.into_object_key()?;
+        types::validate_expiry(expires_in)?;
+        let config = PresigningConfig::expires_in(expires_in).map_err(|_| Error::Presign)?;
+        let req = self
+            .client
+            .as_sdk()
+            .delete_object()
+            .bucket(self.name.as_str())
+            .key(key)
+            .presigned(config)
+            .await
+            .map_err(|_| Error::Presign)?;
+        PresignedRequest::from_sdk(req, expires_in)
+    }
+
     /// Returns a builder for configuring a single-object download with range or conditions.
     #[must_use]
     pub fn get_object(&self, key: impl IntoObjectKey) -> GetObjectBuilder {
         GetObjectBuilder::new(self.clone(), key)
+    }
+
+    /// Fetches an entire object directly into memory.
+    pub async fn get_bytes(&self, key: impl IntoObjectKey) -> Result<ObjectBytes, Error> {
+        let object = self.get_object(key).send().await?;
+        let metadata = object.metadata;
+        let bytes = object
+            .body
+            .collect()
+            .await
+            .map_err(|_| Error::Service {
+                operation: "GetObject",
+            })?
+            .into_bytes();
+        Ok(ObjectBytes { metadata, bytes })
     }
 
     /// Returns a builder for fetching object metadata with conditions.
@@ -1724,13 +1650,9 @@ impl Bucket {
             .key(key)
             .content_length(
                 i64::try_from(content_length).expect("validated single-upload length fits in i64"),
-            )
-            .set_content_type(options.content_type_value())
-            .set_cache_control(options.cache_control_value())
-            .set_content_disposition(options.content_disposition_value())
-            .set_content_encoding(options.content_encoding_value())
-            .set_content_language(options.content_language_value())
-            .set_expires(options.expires_value())
+            );
+        req = options
+            .apply_to(req)
             .set_metadata(options.custom_metadata_values())
             .set_if_match(options.if_match_value())
             .set_if_none_match(options.if_none_match_value());
@@ -1845,13 +1767,9 @@ impl Bucket {
             .key(key)
             .content_length(
                 i64::try_from(content_length).expect("validated single-upload length fits in i64"),
-            )
-            .set_content_type(options.content_type_value())
-            .set_cache_control(options.cache_control_value())
-            .set_content_disposition(options.content_disposition_value())
-            .set_content_encoding(options.content_encoding_value())
-            .set_content_language(options.content_language_value())
-            .set_expires(options.expires_value())
+            );
+        req = options
+            .apply_to(req)
             .set_metadata(options.custom_metadata_values())
             .set_if_match(options.if_match_value())
             .set_if_none_match(options.if_none_match_value());
@@ -1985,7 +1903,7 @@ impl Bucket {
                 error,
                 partial: DeleteObjectsResult::default(),
             })?;
-            object_keys.push(key.into_string());
+            object_keys.push(key.into_inner());
         }
         let keys = object_keys;
 
@@ -2110,15 +2028,13 @@ mod tests {
 
     #[test]
     fn upload_metadata_validation_is_case_insensitive_and_bounded() {
-        let duplicate = ObjectUploadOptions::builder()
-            .custom_metadata("Tenant", "one")
-            .custom_metadata("tenant", "two")
-            .build();
+        let duplicate = ObjectUploadOptions::new()
+            .with_custom_metadata("a", "b")
+            .with_custom_metadata("A", "c");
         assert!(duplicate.validate().is_err());
 
-        let too_large = ObjectUploadOptions::builder()
-            .custom_metadata("large", "x".repeat(MAX_OBJECT_METADATA_BYTES))
-            .build();
+        let too_large = ObjectUploadOptions::new()
+            .with_custom_metadata("large", "x".repeat(MAX_OBJECT_METADATA_BYTES));
         assert!(too_large.validate().is_err());
     }
 

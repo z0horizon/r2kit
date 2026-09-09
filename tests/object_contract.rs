@@ -460,15 +460,13 @@ fn upload_options_validates_checksum_inputs() {
     use r2kit::{ChecksumAlgorithm, ObjectUploadOptions};
 
     // Valid CRC32 Base64 (4 bytes)
-    let options = ObjectUploadOptions::builder()
-        .checksum_value(ChecksumAlgorithm::Crc32, "AAAAAA==")
-        .build();
+    let options =
+        ObjectUploadOptions::new().with_checksum_value(ChecksumAlgorithm::Crc32, "AAAAAA==");
     assert!(!options.is_empty());
 
     // Invalid base64
-    let options = ObjectUploadOptions::builder()
-        .checksum_value(ChecksumAlgorithm::Crc32, "not-base-64!!")
-        .build();
+    let options =
+        ObjectUploadOptions::new().with_checksum_value(ChecksumAlgorithm::Crc32, "not-base-64!!");
     let bucket = offline_bucket();
     let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
         bucket
@@ -484,9 +482,7 @@ fn upload_options_validates_checksum_inputs() {
     ));
 
     // Wrong digest length for CRC32 (1 byte instead of 4)
-    let options = ObjectUploadOptions::builder()
-        .checksum_value(ChecksumAlgorithm::Crc32, "AQ==")
-        .build();
+    let options = ObjectUploadOptions::new().with_checksum_value(ChecksumAlgorithm::Crc32, "AQ==");
     let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
         bucket
             .put_stream_with_options("key", ByteStream::from_static(&[]), 0, options)

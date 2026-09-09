@@ -37,7 +37,7 @@ fn async_handles_are_send_and_sync() {
     assert_send_sync::<r2kit::CopyObjectResult>();
     assert_send_sync::<r2kit::ListObjectsBuilder>();
     assert_send_sync::<r2kit::ObjectUploadOptions>();
-    assert_send_sync::<r2kit::ObjectUploadOptionsBuilder>();
+    assert_send_sync::<r2kit::ObjectBytes>();
     assert_send_sync::<r2kit::PutObjectResult>();
     assert_send_sync::<r2kit::PresignedPutObject>();
     assert_send_sync::<r2kit::DownloadedObject>();
