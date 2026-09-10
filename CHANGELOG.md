@@ -17,7 +17,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Account-level bucket management APIs: `R2Client::create_bucket()`, `R2Client::delete_bucket()`, `R2Client::list_buckets()`, and `R2Client::bucket_exists()` with validated 3-63 character bucket names.
 - A streaming local-download example and an Axum presigned-upload example.
 - Error-handling recipes, centralized transfer limits, and runnable API documentation for all transfer workflows.
+- `Bucket::get_bytes()` returning `ObjectBytes` (bytes and metadata in one call).
+- `Bucket::presign_delete()` for presigned DELETE URLs.
+- `ManagedMultipartBuilder::upload_stream()` for streaming multipart uploads from `AsyncRead` sources with pipelined concurrency.
+- `ObjectUploadOptions::new()` constructor (alias for `Default::default()`).
 
+### Changed
+
+- Generic bounds on public methods tightened from `impl Into<String>` to `impl IntoObjectKey` / `impl IntoBucketName` for compile-time key and bucket name validation.
+- Internal error mapping for GET, HEAD, and COPY operations unified into a shared macro.
+- Tracing no-op simplified to a single-line function when the `tracing` feature is disabled.
+
+### Removed
+
+- `ObjectUploadOptionsBuilder` — use `ObjectUploadOptions::new()` with chainable `.with_*()` methods instead.
+- `ObjectKey::into_string()` and `BucketName::into_string()` — use `.into_inner()` instead.
 ## [0.1.0] - 2026-08-25
 
 ### Added

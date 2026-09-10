@@ -496,3 +496,13 @@ fn upload_options_validates_checksum_inputs() {
         }
     ));
 }
+
+#[tokio::test]
+async fn get_bytes_rejects_invalid_key_before_network() {
+    let bucket = offline_bucket();
+    let result = bucket.get_bytes("").await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput { field: "key", .. }
+    ));
+}

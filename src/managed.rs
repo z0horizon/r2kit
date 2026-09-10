@@ -475,7 +475,12 @@ impl ManagedMultipartBuilder {
             let mut number = 1;
             while remaining > 0 {
                 let current_part_size = remaining.min(part_size);
-                let mut buf = vec![0; current_part_size as usize];
+                let buf_len =
+                    usize::try_from(current_part_size).map_err(|_| Error::InvalidInput {
+                        field: "part_size",
+                        reason: "part size exceeds platform addressable memory",
+                    })?;
+                let mut buf = vec![0; buf_len];
                 if reader.read_exact(&mut buf).await.is_err() {
                     return Err(Error::Io {
                         operation: "read_exact",

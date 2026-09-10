@@ -151,3 +151,44 @@ async fn pre_cancelled_upload_never_starts_a_remote_session() {
     assert!(!error.was_aborted());
     assert!(error.snapshot().is_none());
 }
+
+#[tokio::test]
+async fn upload_stream_rejects_invalid_limits_before_network() {
+    let bucket = offline_bucket();
+    let reader = std::io::Cursor::new(vec![0u8; 64]);
+
+    let error = bucket
+        .managed_multipart("stream.bin")
+        .unwrap()
+        .concurrency(0)
+        .upload_stream(reader, 64)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.error(),
+        Error::Validation(ValidationError::ConcurrencyOutOfRange {
+            provided: 0,
+            min: 1,
+            max: 64
+        })
+    ));
+}
+
+#[tokio::test]
+async fn pre_cancelled_upload_stream_never_starts_a_remote_session() {
+    let cancellation = ManagedUploadCancellation::new();
+    cancellation.cancel();
+    let reader = std::io::Cursor::new(vec![0u8; 5 * 1024 * 1024]);
+
+    let error = offline_bucket()
+        .managed_multipart("cancelled-stream.bin")
+        .unwrap()
+        .cancellation_token(cancellation)
+        .upload_stream(reader, 5 * 1024 * 1024)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error.error(), Error::Cancelled));
+    assert!(!error.was_aborted());
+    assert!(error.snapshot().is_none());
+}
