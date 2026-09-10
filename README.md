@@ -164,17 +164,16 @@ use r2kit::{CacheControl, ObjectUploadOptions, R2Client, mime};
 #[tokio::main]
 async fn main() -> Result<(), r2kit::Error> {
     let bucket = R2Client::from_env()?.bucket("media")?;
-    let options = ObjectUploadOptions::builder()
-        .content_type(mime::IMAGE_JPEG)
-        .cache_control(
+    let options = ObjectUploadOptions::new()
+        .with_content_type(mime::IMAGE_JPEG)
+        .with_cache_control(
             CacheControl::new()
                 .with_public()
                 .with_max_age(Duration::from_secs(3_600)),
         )
-        .content_disposition("attachment; filename=cat.jpg")
-        .content_language("en")
-        .custom_metadata("tenant-id", "tenant-42")
-        .build();
+        .with_content_disposition("attachment; filename=cat.jpg")
+        .with_content_language("en")
+        .with_custom_metadata("tenant-id", "tenant-42");
 
     bucket
         .put_bytes_with_options("photos/cat.jpg", vec![], options)
