@@ -235,6 +235,67 @@ async fn live_presigned_put_and_get_round_trip() {
 
 #[tokio::test]
 #[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_get_bytes_and_presign_delete_round_trip() {
+    let client = live_client();
+    let bucket = client.bucket("r2kit-live-tests").unwrap();
+    let key = format!("_r2kit-tests/{}/get-bytes-delete.bin", uuid::Uuid::new_v4());
+    let body = b"r2kit get_bytes and presigned delete contract".to_vec();
+
+    let result = async {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "failed to build HTTP client")?;
+
+        // 1. Put object
+        bucket
+            .put_bytes(&key, body.clone())
+            .await
+            .map_err(|_| "PUT failed")?;
+
+        // 2. Test get_bytes
+        let object_bytes = bucket
+            .get_bytes(&key)
+            .await
+            .map_err(|_| "get_bytes failed")?;
+        if object_bytes.bytes.as_ref() != body.as_slice() {
+            return Err("get_bytes payload mismatch");
+        }
+        if object_bytes.metadata.size() != body.len() as u64 {
+            return Err("get_bytes metadata size mismatch");
+        }
+
+        // 3. Test presign_delete
+        let signed_delete = bucket
+            .presign_delete(&key, Duration::from_secs(900))
+            .await
+            .map_err(|_| "presign_delete failed")?;
+        let (method, url, headers) = signed_delete.into_exposed_parts();
+        let method = method.parse().map_err(|_| "invalid DELETE method")?;
+        let mut req = http.request(method, url);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        let response = req.send().await.map_err(|_| "DELETE transport failed")?;
+        if !response.status().is_success() {
+            return Err("R2 rejected presigned DELETE");
+        }
+
+        // 4. Confirm object is deleted via HEAD
+        match bucket.head(&key).await {
+            Err(Error::NotFound) => Ok::<(), &'static str>(()),
+            Ok(_) => Err("object still exists after presigned DELETE"),
+            Err(_) => Err("unexpected error checking deleted object"),
+        }
+    }
+    .await;
+
+    let _ = bucket.delete(&key).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
 async fn live_range_get_and_conditional_reads() {
     use r2kit::ByteRange;
 
