@@ -471,7 +471,8 @@ impl ManagedMultipartBuilder {
         mut reader: R,
         session: &PresignedMultipart,
     ) -> Result<ManagedUploadResult, Error> {
-        let channel_size = std::cmp::max(1, (self.max_buffered_bytes / self.part_size) as usize);
+        let max_parts = (self.max_buffered_bytes / self.part_size) as usize;
+        let channel_size = max_parts.saturating_sub(self.concurrency).max(1);
         let (tx, rx) = tokio::sync::mpsc::channel::<(PartNumber, Vec<u8>)>(channel_size);
 
         let part_size = session.snapshot().part_size();
@@ -692,6 +693,19 @@ impl ManagedMultipartBuilder {
                 max: self.max_buffered_bytes,
             }
             .into());
+        }
+        self.options.validate()?;
+        if self.options.checksum().is_some() {
+            return Err(Error::InvalidInput {
+                field: "checksum",
+                reason: "checksum verification is not supported on managed multipart uploads",
+            });
+        }
+        if self.options.if_match().is_some() || self.options.if_none_match().is_some() {
+            return Err(Error::InvalidInput {
+                field: "if_match",
+                reason: "conditional match headers are not supported on managed multipart uploads",
+            });
         }
         if self.resume.is_some() && !self.options.is_empty() {
             return Err(Error::InvalidInput {

@@ -577,3 +577,99 @@ async fn conditional_headers_validate_and_build_before_network() {
         .metadata_directive(r2kit::MetadataDirective::Copy);
     assert!(format!("{copy_req:?}").contains("src.txt"));
 }
+
+#[tokio::test]
+async fn copy_object_rejects_conflicting_or_unsupported_options() {
+    let bucket = offline_bucket();
+    // Rejects upload_options when directive is Copy
+    let err = bucket
+        .copy_object("src.txt", "dst.txt")
+        .metadata_directive(r2kit::MetadataDirective::Copy)
+        .upload_options(ObjectUploadOptions::new())
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::InvalidInput {
+            field: "metadata_directive",
+            ..
+        }
+    ));
+
+    // Rejects checksum in upload_options for copy
+    let err = bucket
+        .copy_object("src.txt", "dst.txt")
+        .upload_options(ObjectUploadOptions::new().with_checksum(r2kit::ChecksumAlgorithm::Sha256))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+
+    // Rejects if_match in upload_options for copy
+    let err = bucket
+        .copy_object("src.txt", "dst.txt")
+        .upload_options(ObjectUploadOptions::new().with_if_match("etag"))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::InvalidInput {
+            field: "if_match",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn conditional_headers_reject_newline_injection() {
+    let bucket = offline_bucket();
+    let err = bucket
+        .get_object("key.txt")
+        .if_match("etag\r\ninjected: true")
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::InvalidInput {
+            field: "if_match",
+            ..
+        }
+    ));
+
+    let err = bucket
+        .head_object("key.txt")
+        .if_none_match("etag\ninjected: true")
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::InvalidInput {
+            field: "if_none_match",
+            ..
+        }
+    ));
+
+    let err = bucket
+        .copy_object("src.txt", "dst.txt")
+        .source_if_match("etag\r\ninjected: true")
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::InvalidInput {
+            field: "source_if_match",
+            ..
+        }
+    ));
+}

@@ -1188,17 +1188,11 @@ impl GetObjectBuilder {
         if let Some(range) = &self.range {
             range.validate()?;
         }
-        if self.if_match.as_ref().is_some_and(String::is_empty) {
-            return Err(Error::InvalidInput {
-                field: "if_match",
-                reason: "must not be empty",
-            });
+        if let Some(if_match) = self.if_match.as_deref() {
+            validate_metadata_header("if_match", if_match)?;
         }
-        if self.if_none_match.as_ref().is_some_and(String::is_empty) {
-            return Err(Error::InvalidInput {
-                field: "if_none_match",
-                reason: "must not be empty",
-            });
+        if let Some(if_none_match) = self.if_none_match.as_deref() {
+            validate_metadata_header("if_none_match", if_none_match)?;
         }
 
         let mut req = self
@@ -1303,17 +1297,11 @@ impl HeadObjectBuilder {
     /// Sends the HEAD request to R2.
     pub async fn send(self) -> Result<ObjectMetadata, Error> {
         let key = self.key?;
-        if self.if_match.as_ref().is_some_and(String::is_empty) {
-            return Err(Error::InvalidInput {
-                field: "if_match",
-                reason: "must not be empty",
-            });
+        if let Some(if_match) = self.if_match.as_deref() {
+            validate_metadata_header("if_match", if_match)?;
         }
-        if self.if_none_match.as_ref().is_some_and(String::is_empty) {
-            return Err(Error::InvalidInput {
-                field: "if_none_match",
-                reason: "must not be empty",
-            });
+        if let Some(if_none_match) = self.if_none_match.as_deref() {
+            validate_metadata_header("if_none_match", if_none_match)?;
         }
 
         let mut req = self
@@ -1449,24 +1437,32 @@ impl CopyObjectBuilder {
             Some(res) => Some(res?),
             None => None,
         };
-        if self.source_if_match.as_ref().is_some_and(String::is_empty) {
-            return Err(Error::InvalidInput {
-                field: "source_if_match",
-                reason: "must not be empty",
-            });
+        if let Some(source_if_match) = self.source_if_match.as_deref() {
+            validate_metadata_header("source_if_match", source_if_match)?;
         }
-        if self
-            .source_if_none_match
-            .as_ref()
-            .is_some_and(String::is_empty)
-        {
-            return Err(Error::InvalidInput {
-                field: "source_if_none_match",
-                reason: "must not be empty",
-            });
+        if let Some(source_if_none_match) = self.source_if_none_match.as_deref() {
+            validate_metadata_header("source_if_none_match", source_if_none_match)?;
         }
         if let Some(options) = &self.metadata_options {
             options.validate()?;
+            if self.metadata_directive == Some(MetadataDirective::Copy) {
+                return Err(Error::InvalidInput {
+                    field: "metadata_directive",
+                    reason: "cannot specify upload_options when metadata_directive is Copy",
+                });
+            }
+            if options.checksum().is_some() {
+                return Err(Error::InvalidInput {
+                    field: "checksum",
+                    reason: "checksum verification is not supported on CopyObject operations",
+                });
+            }
+            if options.if_match().is_some() || options.if_none_match().is_some() {
+                return Err(Error::InvalidInput {
+                    field: "if_match",
+                    reason: "conditional match headers in upload_options are not supported for CopyObject; use source_if_match or source_if_none_match",
+                });
+            }
         }
 
         let source_bucket_name = source_bucket.as_ref().unwrap_or(&self.bucket.name);
@@ -1498,9 +1494,17 @@ impl CopyObjectBuilder {
         if let Some(source_if_unmodified_since) = self.source_if_unmodified_since {
             req = req.copy_source_if_unmodified_since(DateTime::from(source_if_unmodified_since));
         }
-        if let Some(directive) = self.metadata_directive {
-            req = req.metadata_directive(directive.as_sdk_directive());
-        }
+        let effective_directive = match self.metadata_directive {
+            Some(directive) => directive.as_sdk_directive(),
+            None => {
+                if self.metadata_options.is_some() {
+                    aws_sdk_s3::types::MetadataDirective::Replace
+                } else {
+                    aws_sdk_s3::types::MetadataDirective::Copy
+                }
+            }
+        };
+        req = req.metadata_directive(effective_directive);
         if let Some(options) = self.metadata_options {
             req = options
                 .apply_to(req)
@@ -1512,13 +1516,12 @@ impl CopyObjectBuilder {
             .await
             .map_err(|error| map_object_error!("CopyObject", error))?;
 
-        let result = output.copy_object_result;
-        let last_modified = optional_system_time(
-            result.as_ref().and_then(|value| value.last_modified),
-            "CopyObject",
-        )?;
+        let result = output.copy_object_result.ok_or(Error::Service {
+            operation: "CopyObject",
+        })?;
+        let last_modified = optional_system_time(result.last_modified, "CopyObject")?;
         Ok(CopyObjectResult {
-            etag: result.as_ref().and_then(|value| value.e_tag.clone()),
+            etag: result.e_tag,
             last_modified,
         })
     }
@@ -1841,14 +1844,18 @@ impl Bucket {
             .map_err(|_| Error::Io {
                 operation: "download_file",
             })?;
-        tokio::io::copy(&mut reader, &mut file)
-            .await
-            .map_err(|_| Error::Io {
+        if tokio::io::copy(&mut reader, &mut file).await.is_err() {
+            let _ = tokio::fs::remove_file(path.as_ref()).await;
+            return Err(Error::Io {
                 operation: "download_file",
-            })?;
-        file.sync_all().await.map_err(|_| Error::Io {
-            operation: "download_file",
-        })?;
+            });
+        }
+        if file.sync_all().await.is_err() {
+            let _ = tokio::fs::remove_file(path.as_ref()).await;
+            return Err(Error::Io {
+                operation: "download_file",
+            });
+        }
         Ok(metadata)
     }
 

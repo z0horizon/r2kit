@@ -841,12 +841,25 @@ impl PresignedMultipartBuilder {
                 reason: "is required",
             })?,
         )?;
+        self.options.validate()?;
+        if self.options.checksum().is_some() {
+            return Err(Error::InvalidInput {
+                field: "checksum",
+                reason: "checksum verification is not supported on multipart upload sessions; verify individual parts using MD5 or SHA",
+            });
+        }
+        if self.options.if_match().is_some() || self.options.if_none_match().is_some() {
+            return Err(Error::InvalidInput {
+                field: "if_match",
+                reason: "conditional match headers are not supported on multipart upload sessions",
+            });
+        }
         let req = self
             .bucket
             .client
             .as_sdk()
             .create_multipart_upload()
-            .bucket(&self.bucket.name)
+            .bucket(self.bucket.name.as_str())
             .key(&self.key);
         let req = self
             .options
@@ -926,7 +939,7 @@ impl PresignedMultipart {
             .client
             .as_sdk()
             .upload_part()
-            .bucket(&self.bucket.name)
+            .bucket(self.bucket.name.as_str())
             .key(&self.key)
             .upload_id(&self.upload_id)
             .part_number(i32::from(number.get()));
@@ -962,7 +975,7 @@ impl PresignedMultipart {
                 .client
                 .as_sdk()
                 .list_parts()
-                .bucket(&self.bucket.name)
+                .bucket(self.bucket.name.as_str())
                 .key(&self.key)
                 .upload_id(&self.upload_id)
                 .max_parts(1_000)
@@ -1086,7 +1099,7 @@ impl PresignedMultipart {
             .client
             .as_sdk()
             .complete_multipart_upload()
-            .bucket(&self.bucket.name)
+            .bucket(self.bucket.name.as_str())
             .key(&self.key)
             .upload_id(&self.upload_id)
             .multipart_upload(upload)
@@ -1105,7 +1118,7 @@ impl PresignedMultipart {
             .client
             .as_sdk()
             .abort_multipart_upload()
-            .bucket(&self.bucket.name)
+            .bucket(self.bucket.name.as_str())
             .key(&self.key)
             .upload_id(&self.upload_id)
             .send()
@@ -1356,7 +1369,7 @@ impl ListMultipartUploadsBuilder {
             .client
             .as_sdk()
             .list_multipart_uploads()
-            .bucket(&self.bucket.name)
+            .bucket(self.bucket.name.as_str())
             .set_prefix(self.prefix)
             .set_delimiter(self.delimiter)
             .max_uploads(i32::from(self.limit))
@@ -1406,10 +1419,14 @@ impl ListMultipartUploadsBuilder {
             .collect::<Result<Vec<_>, Error>>()?;
 
         let (next_key_marker, next_upload_id_marker) = if output.is_truncated() == Some(true) {
-            (
-                output.next_key_marker.filter(|s| !s.is_empty()),
-                output.next_upload_id_marker.filter(|s| !s.is_empty()),
-            )
+            let key_marker = output.next_key_marker.filter(|s| !s.is_empty());
+            let upload_id_marker = output.next_upload_id_marker.filter(|s| !s.is_empty());
+            if key_marker.is_none() && upload_id_marker.is_none() {
+                return Err(Error::Service {
+                    operation: "ListMultipartUploads",
+                });
+            }
+            (key_marker, upload_id_marker)
         } else {
             (None, None)
         };

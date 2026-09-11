@@ -12,9 +12,9 @@ account endpoint, `auto` signing region, secret-safe presigned requests,
 resumable multipart sessions, and managed file uploads with bounded concurrency
 and exact retries.
 
-> **Status:** `0.1.0` is the initial crates.io release. The API is still
-> evolving, but core object and multipart workflows are verified against live
-> Cloudflare R2.
+> **Status:** `0.2.0` introduces API simplification, streaming multipart
+> transfers, server-side object copy, Range GET, conditional operations, and
+> account bucket management, verified against live Cloudflare R2.
 
 ## Why r2kit?
 
@@ -402,7 +402,7 @@ Enable Serde when a session or protocol DTO crosses a storage or JSON boundary:
 
 ```toml
 [dependencies]
-r2kit = { version = "0.1.0", features = ["serde"] }
+r2kit = { version = "0.2.0", features = ["serde"] }
 ```
 
 `MultipartSessionSnapshot::into_persistence_record()` deliberately exposes a
@@ -445,7 +445,7 @@ Tracing is opt-in and disabled by default:
 
 ```toml
 [dependencies]
-r2kit = { version = "0.1.0", features = ["tracing"] }
+r2kit = { version = "0.2.0", features = ["tracing"] }
 ```
 
 The library emits events to target `r2kit` but never installs a subscriber.
@@ -511,9 +511,8 @@ the object key, enforce size/rate limits, and avoid logging the response.
 - Backend: Cloudflare R2 through `aws-sdk-s3`.
 - License: MIT or Apache-2.0, at your option.
 
-For `0.1`, bucket administration, ACLs, tagging, versioning, object lock,
-folder sync, a CLI, and a custom SigV4 implementation are deliberately out of
-scope.
+ACLs, tagging, versioning, object lock, folder sync, a CLI, and a custom SigV4
+implementation are deliberately out of scope.
 
 ## Development
 

@@ -330,3 +330,43 @@ async fn presign_put_rejects_auto_checksum_without_precomputed_value() {
         }
     ));
 }
+
+#[tokio::test]
+async fn presigned_multipart_rejects_checksum_and_conditional_headers() {
+    let bucket = offline_bucket();
+
+    let options_checksum =
+        ObjectUploadOptions::new().with_checksum(r2kit::ChecksumAlgorithm::Sha256);
+    let result = bucket
+        .presigned_multipart("test-key")
+        .unwrap()
+        .file_size(10 * 1024 * 1024)
+        .part_size_mib(5)
+        .upload_options(options_checksum)
+        .create()
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+
+    let options_if_match = ObjectUploadOptions::new().with_if_match("etag");
+    let result = bucket
+        .presigned_multipart("test-key")
+        .unwrap()
+        .file_size(10 * 1024 * 1024)
+        .part_size_mib(5)
+        .upload_options(options_if_match)
+        .create()
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "if_match",
+            ..
+        }
+    ));
+}

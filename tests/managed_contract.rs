@@ -221,3 +221,43 @@ async fn upload_stream_rejects_resumed_sessions() {
         }
     ));
 }
+
+#[tokio::test]
+async fn managed_multipart_rejects_checksum_and_conditional_headers() {
+    let bucket = offline_bucket();
+    let reader = std::io::Cursor::new(vec![0u8; 1024]);
+
+    let options_checksum =
+        r2kit::ObjectUploadOptions::new().with_checksum(r2kit::ChecksumAlgorithm::Sha256);
+    let err = bucket
+        .managed_multipart("key.bin")
+        .unwrap()
+        .upload_options(options_checksum)
+        .upload_stream(reader, 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.error(),
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+
+    let reader = std::io::Cursor::new(vec![0u8; 1024]);
+    let options_if_match = r2kit::ObjectUploadOptions::new().with_if_match("etag");
+    let err = bucket
+        .managed_multipart("key.bin")
+        .unwrap()
+        .upload_options(options_if_match)
+        .upload_stream(reader, 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.error(),
+        Error::InvalidInput {
+            field: "if_match",
+            ..
+        }
+    ));
+}
