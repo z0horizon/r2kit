@@ -151,3 +151,131 @@ async fn pre_cancelled_upload_never_starts_a_remote_session() {
     assert!(!error.was_aborted());
     assert!(error.snapshot().is_none());
 }
+
+#[tokio::test]
+async fn upload_stream_rejects_invalid_limits_before_network() {
+    let bucket = offline_bucket();
+    let reader = std::io::Cursor::new(vec![0u8; 64]);
+
+    let error = bucket
+        .managed_multipart("stream.bin")
+        .unwrap()
+        .concurrency(0)
+        .upload_stream(reader, 64)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.error(),
+        Error::Validation(ValidationError::ConcurrencyOutOfRange {
+            provided: 0,
+            min: 1,
+            max: 64
+        })
+    ));
+}
+
+#[tokio::test]
+async fn pre_cancelled_upload_stream_never_starts_a_remote_session() {
+    let cancellation = ManagedUploadCancellation::new();
+    cancellation.cancel();
+    let reader = std::io::Cursor::new(vec![0u8; 5 * 1024 * 1024]);
+
+    let error = offline_bucket()
+        .managed_multipart("cancelled-stream.bin")
+        .unwrap()
+        .cancellation_token(cancellation)
+        .upload_stream(reader, 5 * 1024 * 1024)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error.error(), Error::Cancelled));
+    assert!(!error.was_aborted());
+    assert!(error.snapshot().is_none());
+}
+
+#[tokio::test]
+async fn upload_stream_rejects_resumed_sessions() {
+    let bucket = offline_bucket();
+    let snapshot = MultipartSessionSnapshot::restore(
+        "managed-tests",
+        "stream.bin",
+        "existing-upload-id",
+        10 * 1024 * 1024,
+        5 * 1024 * 1024,
+    )
+    .unwrap();
+
+    let reader = std::io::Cursor::new(vec![0u8; 10 * 1024 * 1024]);
+    let error = bucket
+        .resume_managed_multipart(snapshot)
+        .unwrap()
+        .upload_stream(reader, 10 * 1024 * 1024)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.error(),
+        Error::InvalidInput {
+            field: "resume",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn managed_multipart_rejects_checksum_and_conditional_headers() {
+    let bucket = offline_bucket();
+    let reader = std::io::Cursor::new(vec![0u8; 1024]);
+
+    let options_checksum =
+        r2kit::ObjectUploadOptions::new().with_checksum(r2kit::ChecksumAlgorithm::Sha256);
+    let err = bucket
+        .managed_multipart("key.bin")
+        .unwrap()
+        .upload_options(options_checksum)
+        .upload_stream(reader, 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.error(),
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+
+    let reader = std::io::Cursor::new(vec![0u8; 1024]);
+    let options_if_match = r2kit::ObjectUploadOptions::new().with_if_match("etag");
+    let err = bucket
+        .managed_multipart("key.bin")
+        .unwrap()
+        .upload_options(options_if_match)
+        .upload_stream(reader, 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.error(),
+        Error::InvalidInput {
+            field: "if_match",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn upload_stream_bounds_channel_size_when_concurrency_exceeds_max_parts() {
+    let bucket = offline_bucket();
+    let reader = std::io::Cursor::new(vec![0u8; 100]);
+    // max_buffered_bytes = 10 MiB, part_size = 10 MiB -> max_parts = 1.
+    // concurrency = 4 -> max_parts.saturating_sub(concurrency) = 0 -> .max(1) guarantees channel capacity >= 1 without underflow or panic.
+    let result = bucket
+        .managed_multipart("key.bin")
+        .unwrap()
+        .part_size_mib(10)
+        .max_buffered_bytes(10 * 1024 * 1024)
+        .concurrency(4)
+        .upload_stream(reader, 100)
+        .await;
+    let err = result.unwrap_err();
+    assert!(!matches!(err.error(), Error::InvalidInput { .. }));
+}

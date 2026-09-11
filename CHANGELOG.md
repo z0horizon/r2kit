@@ -4,8 +4,34 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-10
 
+### Added
+
+- Range GET with single byte ranges: `ByteRange` enum (`Bounded`, `From`, `Suffix`) and `Bucket::get_object().range(...)`.
+- Conditional operations: `If-Match`, `If-None-Match`, `If-Modified-Since`, and `If-Unmodified-Since` support on `GetObjectBuilder`, `HeadObjectBuilder`, `CopyObjectBuilder`, and `ObjectUploadOptions`, with HTTP 412 mapped to `Error::PreconditionFailed` and HTTP 304 mapped to `Error::NotModified`.
+- Server-side cross-bucket copy and metadata directives: `CopyObjectBuilder` with same-account `source_bucket`, conditional source checks, and `MetadataDirective` (`Copy` or `Replace`).
+- In-progress multipart upload listing: `Bucket::list_multipart_uploads()` returning `MultipartUploadPage` with secret-redacted upload IDs and sendable `.into_pages()` auto-pagination stream.
+- Client-side upload checksum verification: `ChecksumAlgorithm` (`Crc32`, `Crc32c`, `Sha1`, `Sha256`) with automatic digest computation under the `checksum` feature flag and precomputed digest validation.
+- Direct streaming download helper: `Bucket::download_file()` streaming remote bodies directly into local disk files.
+- Account-level bucket management APIs: `R2Client::create_bucket()`, `R2Client::delete_bucket()`, `R2Client::list_buckets()`, and `R2Client::bucket_exists()` with validated 3-63 character bucket names.
+- A streaming local-download example and an Axum presigned-upload example.
+- Error-handling recipes, centralized transfer limits, and runnable API documentation for all transfer workflows.
+- `Bucket::get_bytes()` returning `ObjectBytes` (bytes and metadata in one call).
+- `Bucket::presign_delete()` for presigned DELETE URLs.
+- `ManagedMultipartBuilder::upload_stream()` for streaming multipart uploads from `AsyncRead` sources with pipelined concurrency.
+- `ObjectUploadOptions::new()` constructor (alias for `Default::default()`).
+
+### Changed
+
+- Generic bounds on public methods tightened from `impl Into<String>` to `impl IntoObjectKey` / `impl IntoBucketName` for compile-time key and bucket name validation.
+- Internal error mapping for GET, HEAD, and COPY operations unified into a shared macro.
+- Tracing no-op simplified to a single-line function when the `tracing` feature is disabled.
+
+### Removed
+
+- `ObjectUploadOptionsBuilder` — use `ObjectUploadOptions::new()` with chainable `.with_*()` methods instead.
+- `ObjectKey::into_string()` and `BucketName::into_string()` — use `.into_inner()` instead.
 ## [0.1.0] - 2026-08-25
 
 ### Added
@@ -49,5 +75,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Enforced R2's documented 63-character bucket-name maximum.
 - Enforced R2's effective per-request upload maximum of 5 MiB below 5 GiB.
 
-[Unreleased]: https://github.com/zer0horizon/r2kit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/zer0horizon/r2kit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/zer0horizon/r2kit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zer0horizon/r2kit/releases/tag/v0.1.0

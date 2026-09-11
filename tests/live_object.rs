@@ -30,6 +30,7 @@ async fn live_core_object_round_trip_and_pagination() {
     let prefix = format!("_r2kit-tests/{}/objects/", uuid::Uuid::new_v4());
     let first_key = format!("{prefix}a.txt");
     let second_key = format!("{prefix}b.txt");
+    let copied_key = format!("{prefix}copied file.txt");
     let first_body = b"r2kit object API: first".to_vec();
     let second_body = vec![
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x2b, 0x32, 0xca, 0xce, 0x2c,
@@ -39,22 +40,20 @@ async fn live_core_object_round_trip_and_pagination() {
     let expires = UNIX_EPOCH + Duration::from_secs(1_893_456_000);
 
     let result = async {
-        let options = ObjectUploadOptions::builder()
-            .content_type(mime::TEXT_PLAIN_UTF_8)
-            .content_disposition("attachment; filename=a.txt")
-            .content_language("en-US, vi")
-            .expires(expires)
-            .custom_metadata("test-run", "object-round-trip")
-            .custom_metadata("tenant-id", "tenant-42")
-            .build();
+        let options = ObjectUploadOptions::new()
+            .with_content_type(mime::TEXT_PLAIN_UTF_8)
+            .with_content_disposition("attachment; filename=a.txt")
+            .with_content_language("en-US, vi")
+            .with_expires(expires)
+            .with_custom_metadata("test-run", "object-round-trip")
+            .with_custom_metadata("tenant-id", "tenant-42");
         let put = bucket
             .put_bytes_with_options(&first_key, first_body.clone(), options)
             .await
             .map_err(|_| "first put failed")?;
-        let encoded_options = ObjectUploadOptions::builder()
-            .content_type(mime::TEXT_PLAIN_UTF_8)
-            .content_encoding("gzip")
-            .build();
+        let encoded_options = ObjectUploadOptions::new()
+            .with_content_type(mime::TEXT_PLAIN_UTF_8)
+            .with_content_encoding("gzip");
         bucket
             .put_bytes_with_options(&second_key, second_body.clone(), encoded_options)
             .await
@@ -106,6 +105,24 @@ async fn live_core_object_round_trip_and_pagination() {
             return Err("encoded object bytes differ");
         }
 
+        let copied = bucket
+            .copy(&first_key, &copied_key)
+            .await
+            .map_err(|_| "server-side copy failed")?;
+        let copied_metadata = bucket
+            .head(&copied_key)
+            .await
+            .map_err(|_| "copied object head failed")?;
+        if copied.etag() != copied_metadata.etag()
+            || copied_metadata
+                .custom()
+                .get("tenant-id")
+                .map(String::as_str)
+                != Some("tenant-42")
+        {
+            return Err("copied object metadata differs");
+        }
+
         let pages: Vec<_> = bucket
             .list()
             .prefix(&prefix)
@@ -114,16 +131,16 @@ async fn live_core_object_round_trip_and_pagination() {
             .try_collect()
             .await
             .map_err(|_| "page stream failed")?;
-        if pages.len() != 2 || pages.iter().any(|page| page.objects().len() != 1) {
-            return Err("page stream must return two one-object pages");
+        if pages.len() != 3 || pages.iter().any(|page| page.objects().len() != 1) {
+            return Err("page stream must return three one-object pages");
         }
 
         let deleted = bucket
-            .delete_objects([&first_key, &second_key])
+            .delete_objects([&first_key, &second_key, &copied_key])
             .await
             .map_err(|_| "batch delete request failed")?;
-        if !deleted.is_complete() || deleted.deleted_keys().len() != 2 {
-            return Err("batch delete did not report both keys as deleted");
+        if !deleted.is_complete() || deleted.deleted_keys().len() != 3 {
+            return Err("batch delete did not report all keys as deleted");
         }
         if !matches!(bucket.head(&first_key).await, Err(Error::NotFound)) {
             return Err("batch-deleted key is still readable");
@@ -134,6 +151,7 @@ async fn live_core_object_round_trip_and_pagination() {
 
     let _ = bucket.delete(&first_key).await;
     let _ = bucket.delete(&second_key).await;
+    let _ = bucket.delete(&copied_key).await;
     result.unwrap();
 }
 
@@ -151,18 +169,17 @@ async fn live_presigned_put_and_get_round_trip() {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| "failed to build HTTP client")?;
-        let options = ObjectUploadOptions::builder()
-            .content_type(mime::IMAGE_JPEG)
-            .cache_control(
+        let options = ObjectUploadOptions::new()
+            .with_content_type(mime::IMAGE_JPEG)
+            .with_cache_control(
                 CacheControl::new()
                     .with_public()
                     .with_max_age(Duration::from_secs(3_600)),
             )
-            .content_disposition("attachment; filename=presigned.bin")
-            .content_language("en-US")
-            .expires(expires)
-            .custom_metadata("upload-mode", "presigned")
-            .build();
+            .with_content_disposition("attachment; filename=presigned.bin")
+            .with_content_language("en-US")
+            .with_expires(expires)
+            .with_custom_metadata("upload-mode", "presigned");
         let put = bucket
             .presign_put_with_options(&key, body.len() as u64, Duration::from_secs(900), options)
             .await
@@ -214,4 +231,349 @@ async fn live_presigned_put_and_get_round_trip() {
 
     let _ = bucket.delete(&key).await;
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_get_bytes_and_presign_delete_round_trip() {
+    let client = live_client();
+    let bucket = client.bucket("r2kit-live-tests").unwrap();
+    let key = format!("_r2kit-tests/{}/get-bytes-delete.bin", uuid::Uuid::new_v4());
+    let body = b"r2kit get_bytes and presigned delete contract".to_vec();
+
+    let result = async {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "failed to build HTTP client")?;
+
+        // 1. Put object
+        bucket
+            .put_bytes(&key, body.clone())
+            .await
+            .map_err(|_| "PUT failed")?;
+
+        // 2. Test get_bytes
+        let object_bytes = bucket
+            .get_bytes(&key)
+            .await
+            .map_err(|_| "get_bytes failed")?;
+        if object_bytes.bytes.as_ref() != body.as_slice() {
+            return Err("get_bytes payload mismatch");
+        }
+        if object_bytes.metadata.size() != body.len() as u64 {
+            return Err("get_bytes metadata size mismatch");
+        }
+
+        // 3. Test presign_delete
+        let signed_delete = bucket
+            .presign_delete(&key, Duration::from_secs(900))
+            .await
+            .map_err(|_| "presign_delete failed")?;
+        let (method, url, headers) = signed_delete.into_exposed_parts();
+        let method = method.parse().map_err(|_| "invalid DELETE method")?;
+        let mut req = http.request(method, url);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        let response = req.send().await.map_err(|_| "DELETE transport failed")?;
+        if !response.status().is_success() {
+            return Err("R2 rejected presigned DELETE");
+        }
+
+        // 4. Confirm object is deleted via HEAD
+        match bucket.head(&key).await {
+            Err(Error::NotFound) => Ok::<(), &'static str>(()),
+            Ok(_) => Err("object still exists after presigned DELETE"),
+            Err(_) => Err("unexpected error checking deleted object"),
+        }
+    }
+    .await;
+
+    let _ = bucket.delete(&key).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_range_get_and_conditional_reads() {
+    use r2kit::ByteRange;
+
+    let client = live_client();
+    let bucket = client.bucket("r2kit-live-tests").unwrap();
+    let key = format!("_r2kit-tests/{}/range.bin", uuid::Uuid::new_v4());
+    let body = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
+
+    let result = async {
+        let put = bucket
+            .put_bytes(&key, body.clone())
+            .await
+            .map_err(|_| "put failed")?;
+        let etag = put.etag().ok_or("missing etag")?;
+
+        // 1. Partial Bounded GET: bytes 0..=9
+        let partial = bucket
+            .get_object(&key)
+            .range(ByteRange::Bounded(0, 9))
+            .send()
+            .await
+            .map_err(|_| "partial bounded get failed")?
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| "partial body failed")?
+            .into_bytes();
+        if partial.as_ref() != &body[0..10] {
+            return Err("bounded range body differs");
+        }
+
+        // 2. From offset GET: bytes 10..
+        let from_offset = bucket
+            .get_object(&key)
+            .range(ByteRange::From(10))
+            .send()
+            .await
+            .map_err(|_| "from offset get failed")?
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| "from offset body failed")?
+            .into_bytes();
+        if from_offset.as_ref() != &body[10..] {
+            return Err("from range body differs");
+        }
+
+        // 3. Suffix GET: last 5 bytes
+        let suffix = bucket
+            .get_object(&key)
+            .range(ByteRange::Suffix(5))
+            .send()
+            .await
+            .map_err(|_| "suffix get failed")?
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| "suffix body failed")?
+            .into_bytes();
+        if suffix.as_ref() != &body[body.len() - 5..] {
+            return Err("suffix range body differs");
+        }
+
+        // 4. If-Match matching ETag -> success
+        let if_match_ok = bucket.get_object(&key).if_match(etag).send().await;
+        if if_match_ok.is_err() {
+            return Err("if_match with exact etag should succeed");
+        }
+
+        // 5. If-Match mismatch -> PreconditionFailed
+        let if_match_err = bucket
+            .get_object(&key)
+            .if_match("\"mismatched-etag\"")
+            .send()
+            .await;
+        if !matches!(if_match_err, Err(Error::PreconditionFailed)) {
+            return Err("if_match with wrong etag must return PreconditionFailed");
+        }
+
+        // 6. If-None-Match matching ETag -> NotModified
+        let if_none_match_not_mod = bucket.get_object(&key).if_none_match(etag).send().await;
+        if !matches!(if_none_match_not_mod, Err(Error::NotModified)) {
+            return Err("if_none_match with exact etag must return NotModified");
+        }
+
+        Ok::<(), &'static str>(())
+    }
+    .await;
+
+    let _ = bucket.delete(&key).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_download_file_to_local_disk() {
+    let client = live_client();
+    let bucket = client.bucket("r2kit-live-tests").unwrap();
+    let key = format!("_r2kit-tests/{}/download_file.bin", uuid::Uuid::new_v4());
+    let body = b"streamed direct to disk via r2kit".to_vec();
+
+    let result = async {
+        bucket
+            .put_bytes(&key, body.clone())
+            .await
+            .map_err(|_| "put failed")?;
+
+        let temp_dir = tempfile::tempdir().map_err(|_| "tempdir failed")?;
+        let file_path = temp_dir.path().join("downloaded.bin");
+
+        let metadata = bucket
+            .download_file(&key, &file_path)
+            .await
+            .map_err(|_| "download_file failed")?;
+        if metadata.size() != body.len() as u64 {
+            return Err("download_file metadata has wrong size");
+        }
+
+        let read_bytes = tokio::fs::read(&file_path)
+            .await
+            .map_err(|_| "read temp file failed")?;
+        if read_bytes != body {
+            return Err("file content on disk differs from uploaded body");
+        }
+
+        Ok::<(), &'static str>(())
+    }
+    .await;
+
+    let _ = bucket.delete(&key).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_checksum_upload_with_auto_and_precomputed() {
+    #[cfg(feature = "checksum")]
+    use base64::Engine as _;
+    use r2kit::{ChecksumAlgorithm, ObjectUploadOptions};
+
+    let client = live_client();
+    let bucket = client.bucket("r2kit-live-tests").unwrap();
+    let prefix = format!("_r2kit-tests/{}/checksum/", uuid::Uuid::new_v4());
+    let sha256_key = format!("{prefix}sha256.bin");
+    let crc32_key = format!("{prefix}crc32.bin");
+    let body = b"r2kit checksum validation test content".to_vec();
+
+    let result = async {
+        // 1. Auto-computed SHA-256 upload
+        let sha256_options = ObjectUploadOptions::new().with_checksum(ChecksumAlgorithm::Sha256);
+        let put_sha256 = bucket
+            .put_bytes_with_options(&sha256_key, body.clone(), sha256_options)
+            .await
+            .map_err(|_| "auto sha256 upload failed")?;
+        if put_sha256.etag().is_none() {
+            return Err("missing etag on sha256 upload");
+        }
+
+        // 2. Pre-computed CRC32 upload
+        // Base64 for CRC32 of `body`:
+        #[cfg(feature = "checksum")]
+        let crc32_b64 = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&body);
+            let digest = hasher.finalize().to_be_bytes();
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        };
+        #[cfg(not(feature = "checksum"))]
+        let crc32_b64 = "dummy".to_string();
+
+        let crc32_options =
+            ObjectUploadOptions::new().with_checksum_value(ChecksumAlgorithm::Crc32, crc32_b64);
+        let put_crc32 = bucket
+            .put_bytes_with_options(&crc32_key, body.clone(), crc32_options)
+            .await
+            .map_err(|_| "precomputed crc32 upload failed")?;
+        if put_crc32.etag().is_none() {
+            return Err("missing etag on crc32 upload");
+        }
+
+        Ok::<(), &'static str>(())
+    }
+    .await;
+
+    let _ = bucket.delete(&sha256_key).await;
+    let _ = bucket.delete(&crc32_key).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_list_multipart_uploads_and_cleanup() {
+    let client = live_client();
+    let bucket = client.bucket("r2kit-live-tests").unwrap();
+    let prefix = format!("_r2kit-tests/{}/mp_list/", uuid::Uuid::new_v4());
+    let key = format!("{prefix}upload.bin");
+
+    let result = async {
+        // Start a multipart upload
+        let session = bucket
+            .presigned_multipart(&key)
+            .map_err(|_| "invalid key")?
+            .file_size(10 * 1024 * 1024)
+            .part_size_mib(5)
+            .create()
+            .await
+            .map_err(|_| "start multipart session failed")?;
+
+        // List multipart uploads with prefix
+        let pages: Vec<_> = bucket
+            .list_multipart_uploads()
+            .prefix(&prefix)
+            .into_pages()
+            .try_collect()
+            .await
+            .map_err(|_| "list_multipart_uploads into_pages failed")?;
+
+        let all_uploads: Vec<_> = pages
+            .into_iter()
+            .flat_map(|page| page.uploads().to_vec())
+            .collect();
+
+        if !all_uploads.iter().any(|u| u.key() == key) {
+            return Err("created multipart upload not found in list_multipart_uploads");
+        }
+
+        // Abort the session
+        session.abort().await.map_err(|_| "abort session failed")?;
+
+        // List again to verify it is gone
+        let pages_after: Vec<_> = bucket
+            .list_multipart_uploads()
+            .prefix(&prefix)
+            .into_pages()
+            .try_collect()
+            .await
+            .map_err(|_| "list_multipart_uploads after abort failed")?;
+
+        let remaining: Vec<_> = pages_after
+            .into_iter()
+            .flat_map(|page| page.uploads().to_vec())
+            .collect();
+
+        if remaining.iter().any(|u| u.key() == key) {
+            return Err("aborted upload still visible in list_multipart_uploads");
+        }
+
+        Ok::<(), &'static str>(())
+    }
+    .await;
+
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_list_buckets_and_bucket_exists() {
+    let client = live_client();
+    let bucket_name = "r2kit-live-tests";
+
+    let exists = client
+        .bucket_exists(bucket_name)
+        .await
+        .expect("bucket_exists should succeed for existing bucket");
+    assert!(exists, "expected dedicated live bucket to exist");
+
+    let not_exists = client
+        .bucket_exists("r2kit-nonexistent-bucket-99999")
+        .await
+        .expect("bucket_exists should succeed for non-existent bucket");
+    assert!(!not_exists, "expected non-existent bucket to return false");
+
+    let buckets = client
+        .list_buckets()
+        .await
+        .expect("list_buckets should succeed");
+    assert!(
+        buckets.iter().any(|b| b.name() == bucket_name),
+        "list_buckets should include the dedicated test bucket"
+    );
 }

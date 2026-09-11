@@ -12,9 +12,9 @@ account endpoint, `auto` signing region, secret-safe presigned requests,
 resumable multipart sessions, and managed file uploads with bounded concurrency
 and exact retries.
 
-> **Status:** `0.1.0` is the initial crates.io release. The API is still
-> evolving, but core object and multipart workflows are verified against live
-> Cloudflare R2.
+> **Status:** `0.2.0` introduces API simplification, streaming multipart
+> transfers, server-side object copy, Range GET, conditional operations, and
+> account bucket management, verified against live Cloudflare R2.
 
 ## Why r2kit?
 
@@ -130,6 +130,7 @@ invariants.
 | Upload a known-length async body | `Bucket::put_stream` |
 | Download without buffering the whole object | `Bucket::get` |
 | Upload a local file with concurrency and retries | `Bucket::managed_multipart` |
+| Copy an object without downloading it | `Bucket::copy` |
 | Let a browser or mobile client upload directly | `Bucket::presigned_multipart` |
 | Resume a persisted upload session | `Bucket::resume_managed_multipart` or `resume_presigned_multipart` |
 | Verify bucket existence and list permission at startup | `R2Client::validate_bucket` or `Bucket::validate_access` |
@@ -163,17 +164,16 @@ use r2kit::{CacheControl, ObjectUploadOptions, R2Client, mime};
 #[tokio::main]
 async fn main() -> Result<(), r2kit::Error> {
     let bucket = R2Client::from_env()?.bucket("media")?;
-    let options = ObjectUploadOptions::builder()
-        .content_type(mime::IMAGE_JPEG)
-        .cache_control(
+    let options = ObjectUploadOptions::new()
+        .with_content_type(mime::IMAGE_JPEG)
+        .with_cache_control(
             CacheControl::new()
                 .with_public()
                 .with_max_age(Duration::from_secs(3_600)),
         )
-        .content_disposition("attachment; filename=cat.jpg")
-        .content_language("en")
-        .custom_metadata("tenant-id", "tenant-42")
-        .build();
+        .with_content_disposition("attachment; filename=cat.jpg")
+        .with_content_language("en")
+        .with_custom_metadata("tenant-id", "tenant-42");
 
     bucket
         .put_bytes_with_options("photos/cat.jpg", vec![], options)
@@ -402,7 +402,7 @@ Enable Serde when a session or protocol DTO crosses a storage or JSON boundary:
 
 ```toml
 [dependencies]
-r2kit = { version = "0.1.0", features = ["serde"] }
+r2kit = { version = "0.2.0", features = ["serde"] }
 ```
 
 `MultipartSessionSnapshot::into_persistence_record()` deliberately exposes a
@@ -445,7 +445,7 @@ Tracing is opt-in and disabled by default:
 
 ```toml
 [dependencies]
-r2kit = { version = "0.1.0", features = ["tracing"] }
+r2kit = { version = "0.2.0", features = ["tracing"] }
 ```
 
 The library emits events to target `r2kit` but never installs a subscriber.
@@ -476,11 +476,33 @@ Report vulnerabilities through GitHub's private security advisory flow. See
 
 - [Object round trip](examples/object_round_trip.rs)
 - [Managed file upload](examples/managed_upload.rs)
+- [Streaming download to a local file](examples/download_to_file.rs)
+- [Axum endpoint returning a presigned upload request](examples/presigned_upload_axum.rs)
+- [Error handling cookbook](docs/error-handling.md)
+- [Transfer limits and memory guidance](docs/limits.md)
 - [Architecture and protocol invariants](docs/design.md)
 - [API documentation](https://docs.rs/r2kit)
 
-The runnable examples require `R2_BUCKET` and `R2_KEY`. The managed upload
-example additionally accepts the local file path as its first argument.
+The runnable examples use the `R2_*` credentials described in Quick start.
+Object examples also require `R2_BUCKET` and `R2_KEY`:
+
+```sh
+cargo run --example object_round_trip
+cargo run --example managed_upload -- ./large-video.mp4
+cargo run --example download_to_file -- ./download.bin
+```
+
+`download_to_file` truncates an existing destination. The Axum example only
+requires `R2_BUCKET`; start it and request an exact-length, ten-minute upload:
+
+```sh
+cargo run --example presigned_upload_axum
+curl -X POST 'http://127.0.0.1:3000/uploads/photos/cat.jpg?content_length=12345'
+```
+
+The JSON response contains a bearer URL and all signed headers the client must
+replay exactly. A production handler must authenticate the caller, authorize
+the object key, enforce size/rate limits, and avoid logging the response.
 
 ## Compatibility and scope
 
@@ -489,9 +511,8 @@ example additionally accepts the local file path as its first argument.
 - Backend: Cloudflare R2 through `aws-sdk-s3`.
 - License: MIT or Apache-2.0, at your option.
 
-For `0.1`, bucket administration, ACLs, tagging, versioning, object lock,
-folder sync, a CLI, and a custom SigV4 implementation are deliberately out of
-scope.
+ACLs, tagging, versioning, object lock, folder sync, a CLI, and a custom SigV4
+implementation are deliberately out of scope.
 
 ## Development
 

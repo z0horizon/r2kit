@@ -1,6 +1,6 @@
 [package]
 name = "r2kit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94.1"
 publish = ["crates-io"]
@@ -12,9 +12,10 @@ documentation = "https://docs.rs/r2kit"
 readme = "README.md"
 keywords = ["cloudflare", "r2", "s3", "object-storage", "multipart"]
 categories = ["api-bindings", "asynchronous", "web-programming"]
-include = ["/src/**", "/tests/**", "/examples/**", "/docs/**", "/Cargo.toml", "/CHANGELOG.md", "/CONTRIBUTING.md", "/README.md", "/SECURITY.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
+include = ["/src/**", "/tests/**", "/examples/**", "/docs/**", "!/docs/agents/**", "!/docs/adr/**", "/Cargo.toml", "/CHANGELOG.md", "/CONTRIBUTING.md", "/README.md", "/SECURITY.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 [features]
+checksum = ["dep:crc32fast", "dep:crc32c", "dep:sha2", "dep:sha1"]
 default = []
 live-tests = []
 serde = ["dep:serde"]
@@ -25,16 +26,22 @@ aws-sdk-s3 = { version = "=1.143.0", default-features = false, features = ["defa
 aws-smithy-types = "1"
 bytes = "1"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+crc32c = { version = "0.6", optional = true }
+crc32fast = { version = "1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["async-await", "std"] }
 fastrand = "2"
 headers = "0.4"
 mime = "0.3"
 oxilangtag = { version = "0.1.6", default-features = false }
+percent-encoding = "2"
 serde = { version = "1", features = ["derive"], optional = true }
+sha1 = { version = "0.10", optional = true, default-features = false }
+sha2 = { version = "0.10", optional = true, default-features = false }
 tokio = { version = "1", default-features = false, features = ["fs", "io-util", "sync", "time"] }
 tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
+axum = "0.8"
 md-5 = "0.11"
 mime_guess = "2"
 proptest = "1"

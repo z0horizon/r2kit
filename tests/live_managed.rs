@@ -91,6 +91,54 @@ async fn live_managed_upload_reports_progress_and_cleans_up() {
 
 #[tokio::test]
 #[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_managed_upload_stream_reports_progress_and_cleans_up() {
+    let client = live_client();
+    let bucket = client.bucket("r2kit-live-tests").unwrap();
+    let id = uuid::Uuid::new_v4();
+    let key = format!("_r2kit-tests/{id}/managed-stream.bin");
+    let body = test_body();
+    let reader = std::io::Cursor::new(body.clone());
+    let updates = Arc::new(Mutex::new(Vec::<ManagedUploadProgress>::new()));
+    let captured = Arc::clone(&updates);
+
+    let result = bucket
+        .managed_multipart(&key)
+        .unwrap()
+        .part_size((5 * MIB) as u64)
+        .content_type("video/mp4".parse::<mime::Mime>().unwrap())
+        .cache_control(CacheControl::new().with_private())
+        .concurrency(2)
+        .max_attempts(4)
+        .on_progress(move |progress| captured.lock().unwrap().push(progress))
+        .upload_stream(reader, body.len() as u64)
+        .await;
+
+    match result {
+        Ok(result) => {
+            assert_eq!(result.file_size(), body.len() as u64);
+            assert_eq!(result.part_count(), 3);
+            assert_eq!(result.uploaded_parts(), 3);
+            assert_eq!(result.reused_parts(), 0);
+            assert_remote_bytes(&bucket, &key, &body).await;
+            let metadata = bucket.head(&key).await.unwrap();
+            assert_eq!(metadata.content_type(), Some("video/mp4"));
+            assert!(
+                metadata
+                    .cache_control()
+                    .is_some_and(|value| value.contains("private"))
+            );
+            let updates = updates.lock().unwrap();
+            let final_update = updates.last().unwrap();
+            assert_eq!(final_update.completed_parts(), 3);
+            assert_eq!(final_update.transferred_bytes(), body.len() as u64);
+        }
+        Err(error) => panic!("managed stream upload failed: {error}"),
+    }
+    bucket.delete(&key).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
 async fn live_managed_resume_reuses_an_existing_part() {
     let client = live_client();
     let bucket = client.bucket("r2kit-live-tests").unwrap();

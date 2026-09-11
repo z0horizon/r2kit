@@ -162,18 +162,42 @@ async fn presigns_single_get_and_put_with_redacted_bearer_urls() {
     assert!(put.request().url().expose().contains("X-Amz-Signature="));
     assert!(!format!("{put:?}").contains("X-Amz-Signature"));
 }
+#[tokio::test]
+async fn presigned_delete_validates_key_and_expiry() {
+    let bucket = offline_bucket();
+    assert!(matches!(
+        bucket
+            .presign_delete("", Duration::from_secs(900))
+            .await
+            .unwrap_err(),
+        r2kit::Error::InvalidInput { field: "key", .. }
+    ));
+
+    assert!(matches!(
+        bucket
+            .presign_delete("key", Duration::from_secs(999999999))
+            .await
+            .unwrap_err(),
+        r2kit::Error::Validation(r2kit::ValidationError::PresignExpiryOutOfRange { .. })
+    ));
+
+    let req = bucket
+        .presign_delete("key", Duration::from_secs(900))
+        .await
+        .unwrap();
+    assert_eq!(req.method(), "DELETE");
+}
 
 #[tokio::test]
 async fn presigned_put_signs_typed_object_metadata_as_required_headers() {
     let bucket = offline_bucket();
-    let options = ObjectUploadOptions::builder()
-        .content_type(mime::IMAGE_JPEG)
-        .cache_control(
+    let options = ObjectUploadOptions::new()
+        .with_content_type(mime::IMAGE_JPEG)
+        .with_cache_control(
             CacheControl::new()
                 .with_public()
                 .with_max_age(Duration::from_secs(3_600)),
-        )
-        .build();
+        );
     let put = bucket
         .presign_put_with_options("photos/cat.jpg", 42, Duration::from_secs(900), options)
         .await
@@ -197,13 +221,12 @@ async fn presigned_put_signs_typed_object_metadata_as_required_headers() {
 async fn presigned_put_signs_extended_headers_and_custom_metadata() {
     let bucket = offline_bucket();
     let expires = UNIX_EPOCH + Duration::from_secs(1_893_456_000);
-    let options = ObjectUploadOptions::builder()
-        .content_disposition("attachment; filename=report.csv")
-        .content_encoding("gzip")
-        .content_language("en-US")
-        .expires(expires)
-        .custom_metadata("tenant-id", "tenant-42")
-        .build();
+    let options = ObjectUploadOptions::new()
+        .with_content_disposition("attachment; filename=report.csv")
+        .with_content_encoding("gzip")
+        .with_content_language("en-US")
+        .with_expires(expires)
+        .with_custom_metadata("tenant-id", "tenant-42");
     let put = bucket
         .presign_put_with_options(
             "reports/report.csv.gz",
@@ -238,10 +261,9 @@ async fn presigned_put_signs_extended_headers_and_custom_metadata() {
 #[tokio::test]
 async fn rejects_invalid_upload_metadata_before_signing() {
     let bucket = offline_bucket();
-    let duplicate = ObjectUploadOptions::builder()
-        .custom_metadata("Tenant", "one")
-        .custom_metadata("tenant", "two")
-        .build();
+    let duplicate = ObjectUploadOptions::new()
+        .with_custom_metadata("Tenant", "one")
+        .with_custom_metadata("tenant", "two");
     let error = bucket
         .presign_put_with_options("key", 1, Duration::from_secs(60), duplicate)
         .await
@@ -254,9 +276,7 @@ async fn rejects_invalid_upload_metadata_before_signing() {
         }
     ));
 
-    let prefixed = ObjectUploadOptions::builder()
-        .custom_metadata("x-amz-meta-tenant", "one")
-        .build();
+    let prefixed = ObjectUploadOptions::new().with_custom_metadata("x-amz-meta-tenant", "one");
     let error = bucket
         .presign_put_with_options("key", 1, Duration::from_secs(60), prefixed)
         .await
@@ -292,5 +312,61 @@ async fn rejects_invalid_single_object_presign_contracts() {
             provided: 5_363_466_241,
             max: 5_363_466_240
         }))
+    ));
+}
+
+#[tokio::test]
+async fn presign_put_rejects_auto_checksum_without_precomputed_value() {
+    let bucket = offline_bucket();
+    let options = ObjectUploadOptions::new().with_checksum(r2kit::ChecksumAlgorithm::Sha256);
+    let result = bucket
+        .presign_put_with_options("test-key", 0, Duration::from_secs(60), options)
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn presigned_multipart_rejects_checksum_and_conditional_headers() {
+    let bucket = offline_bucket();
+
+    let options_checksum =
+        ObjectUploadOptions::new().with_checksum(r2kit::ChecksumAlgorithm::Sha256);
+    let result = bucket
+        .presigned_multipart("test-key")
+        .unwrap()
+        .file_size(10 * 1024 * 1024)
+        .part_size_mib(5)
+        .upload_options(options_checksum)
+        .create()
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+
+    let options_if_match = ObjectUploadOptions::new().with_if_match("etag");
+    let result = bucket
+        .presigned_multipart("test-key")
+        .unwrap()
+        .file_size(10 * 1024 * 1024)
+        .part_size_mib(5)
+        .upload_options(options_if_match)
+        .create()
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "if_match",
+            ..
+        }
     ));
 }

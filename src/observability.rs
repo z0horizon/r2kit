@@ -1,6 +1,7 @@
 use crate::ServiceError;
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
 enum SafeEvent {
     RemoteFailure {
         operation: &'static str,
@@ -111,36 +112,7 @@ fn emit(event: SafeEvent) {
 }
 
 #[cfg(not(feature = "tracing"))]
-fn emit(event: SafeEvent) {
-    match event {
-        SafeEvent::RemoteFailure {
-            operation,
-            kind,
-            status,
-        } => {
-            let _ = (operation, kind, status);
-        }
-        SafeEvent::Preflight { phase } => {
-            let _ = phase;
-        }
-        SafeEvent::ManagedUpload {
-            phase,
-            part_size,
-            concurrency,
-            max_attempts,
-        } => {
-            let _ = (phase, part_size, concurrency, max_attempts);
-        }
-        SafeEvent::UploadPartRetry {
-            part_number,
-            attempt,
-            max_attempts,
-            delay_ms,
-        } => {
-            let _ = (part_number, attempt, max_attempts, delay_ms);
-        }
-    }
-}
+fn emit(_event: SafeEvent) {}
 
 #[cfg(test)]
 mod tests {
