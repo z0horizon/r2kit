@@ -261,3 +261,21 @@ async fn managed_multipart_rejects_checksum_and_conditional_headers() {
         }
     ));
 }
+
+#[tokio::test]
+async fn upload_stream_bounds_channel_size_when_concurrency_exceeds_max_parts() {
+    let bucket = offline_bucket();
+    let reader = std::io::Cursor::new(vec![0u8; 100]);
+    // max_buffered_bytes = 10 MiB, part_size = 10 MiB -> max_parts = 1.
+    // concurrency = 4 -> max_parts.saturating_sub(concurrency) = 0 -> .max(1) guarantees channel capacity >= 1 without underflow or panic.
+    let result = bucket
+        .managed_multipart("key.bin")
+        .unwrap()
+        .part_size_mib(10)
+        .max_buffered_bytes(10 * 1024 * 1024)
+        .concurrency(4)
+        .upload_stream(reader, 100)
+        .await;
+    let err = result.unwrap_err();
+    assert!(!matches!(err.error(), Error::InvalidInput { .. }));
+}

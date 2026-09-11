@@ -673,3 +673,126 @@ async fn conditional_headers_reject_newline_injection() {
         }
     ));
 }
+
+#[tokio::test]
+async fn copy_object_defaults_to_replace_directive_when_upload_options_present() {
+    let bucket = offline_bucket();
+    let valid_options = ObjectUploadOptions::new().with_content_type(r2kit::mime::TEXT_PLAIN);
+    // Does NOT explicitly call .metadata_directive(...)
+    let result = bucket
+        .copy_object("src.txt", "dst.txt")
+        .upload_options(valid_options)
+        .send()
+        .await;
+    // Input validation succeeds; fails on network/service dispatch because offline client endpoint is dummy
+    let err = result.unwrap_err();
+    assert!(!matches!(err, Error::InvalidInput { .. }));
+}
+
+#[tokio::test]
+async fn download_file_cleans_up_file_on_stream_failure() {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nETag: \"etag\"\r\n\r\npartial";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            // Drop stream immediately to simulate connection reset / truncated stream
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let target_path = temp_dir.path().join("partial_download.bin");
+
+    let result = bucket.download_file("test.bin", &target_path).await;
+    let _ = server.join();
+
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::Io {
+            operation: "download_file"
+        }
+    ));
+    assert!(
+        !target_path.exists(),
+        "partial file must be deleted if download stream fails"
+    );
+}
+
+#[tokio::test]
+async fn list_multipart_uploads_rejects_truncated_response_without_markers() {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Bucket>contract-tests</Bucket>
+    <IsTruncated>true</IsTruncated>
+</ListMultipartUploadsResult>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    let result = bucket.list_multipart_uploads().send().await;
+    let _ = server.join();
+
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::Service {
+            operation: "ListMultipartUploads"
+        }
+    ));
+}
