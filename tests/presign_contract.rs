@@ -314,3 +314,19 @@ async fn rejects_invalid_single_object_presign_contracts() {
         }))
     ));
 }
+
+#[tokio::test]
+async fn presign_put_rejects_auto_checksum_without_precomputed_value() {
+    let bucket = offline_bucket();
+    let options = ObjectUploadOptions::new().with_checksum(r2kit::ChecksumAlgorithm::Sha256);
+    let result = bucket
+        .presign_put_with_options("test-key", 0, Duration::from_secs(60), options)
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+}

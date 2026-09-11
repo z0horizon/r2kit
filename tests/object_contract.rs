@@ -1,5 +1,5 @@
 use aws_sdk_s3::{config::Credentials, primitives::ByteStream};
-use r2kit::{Error, R2Client, R2Config, ValidationError};
+use r2kit::{ChecksumAlgorithm, Error, ObjectUploadOptions, R2Client, R2Config, ValidationError};
 
 fn offline_client() -> R2Client {
     let config = R2Config::builder()
@@ -505,4 +505,75 @@ async fn get_bytes_rejects_invalid_key_before_network() {
         result.unwrap_err(),
         Error::InvalidInput { field: "key", .. }
     ));
+}
+
+#[tokio::test]
+async fn put_stream_rejects_auto_checksum_without_precomputed_value() {
+    let bucket = offline_bucket();
+    let options = ObjectUploadOptions::new().with_checksum(ChecksumAlgorithm::Sha256);
+    let result = bucket
+        .put_stream_with_options("test-key", ByteStream::from_static(b""), 0, options)
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "checksum",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn copy_object_validates_metadata_options_before_network() {
+    let bucket = offline_bucket();
+    let invalid_options =
+        ObjectUploadOptions::new().with_content_language("invalid language tag!!!");
+    let result = bucket
+        .copy_object("src.txt", "dst.txt")
+        .metadata_directive(r2kit::MetadataDirective::Replace)
+        .upload_options(invalid_options)
+        .send()
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "content_language",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn conditional_headers_validate_and_build_before_network() {
+    let bucket = offline_bucket();
+    let now = std::time::SystemTime::now();
+
+    // GetObjectBuilder with conditional headers
+    let get_req = bucket
+        .get_object("key.txt")
+        .if_modified_since(now)
+        .if_unmodified_since(now)
+        .if_match("etag-1")
+        .if_none_match("etag-2");
+    assert!(format!("{get_req:?}").contains("key.txt"));
+
+    // HeadObjectBuilder with conditional headers
+    let head_req = bucket
+        .head_object("key.txt")
+        .if_modified_since(now)
+        .if_unmodified_since(now)
+        .if_match("etag-1")
+        .if_none_match("etag-2");
+    assert!(format!("{head_req:?}").contains("key.txt"));
+
+    // CopyObjectBuilder with source conditional headers
+    let copy_req = bucket
+        .copy_object("src.txt", "dst.txt")
+        .source_if_modified_since(now)
+        .source_if_unmodified_since(now)
+        .source_if_match("etag-1")
+        .source_if_none_match("etag-2")
+        .source_bucket("other-bucket")
+        .metadata_directive(r2kit::MetadataDirective::Copy);
+    assert!(format!("{copy_req:?}").contains("src.txt"));
 }

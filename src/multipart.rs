@@ -1191,12 +1191,24 @@ impl fmt::Debug for MultipartUploadSummary {
 }
 
 /// One bounded page of in-progress multipart uploads.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MultipartUploadPage {
     uploads: Vec<MultipartUploadSummary>,
     common_prefixes: Vec<String>,
     next_key_marker: Option<String>,
     next_upload_id_marker: Option<String>,
+}
+
+impl fmt::Debug for MultipartUploadPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_upload_id_marker = self.next_upload_id_marker.as_ref().map(|_| "[REDACTED]");
+        f.debug_struct("MultipartUploadPage")
+            .field("uploads", &self.uploads)
+            .field("common_prefixes", &self.common_prefixes)
+            .field("next_key_marker", &self.next_key_marker)
+            .field("next_upload_id_marker", &redacted_upload_id_marker)
+            .finish()
+    }
 }
 
 impl MultipartUploadPage {
@@ -1226,7 +1238,7 @@ impl MultipartUploadPage {
 }
 
 /// Builder for listing in-progress multipart uploads in an R2 bucket.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ListMultipartUploadsBuilder {
     bucket: Bucket,
     prefix: Option<String>,
@@ -1234,6 +1246,20 @@ pub struct ListMultipartUploadsBuilder {
     limit: u16,
     key_marker: Option<String>,
     upload_id_marker: Option<String>,
+}
+
+impl fmt::Debug for ListMultipartUploadsBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_upload_id_marker = self.upload_id_marker.as_ref().map(|_| "[REDACTED]");
+        f.debug_struct("ListMultipartUploadsBuilder")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("delimiter", &self.delimiter)
+            .field("limit", &self.limit)
+            .field("key_marker", &self.key_marker)
+            .field("upload_id_marker", &redacted_upload_id_marker)
+            .finish()
+    }
 }
 
 impl ListMultipartUploadsBuilder {
@@ -1563,5 +1589,17 @@ mod tests {
         )
         .unwrap();
         assert!(!format!("{snapshot:?}").contains("secret-upload-id"));
+
+        let page = MultipartUploadPage {
+            uploads: Vec::new(),
+            common_prefixes: Vec::new(),
+            next_key_marker: Some("next-key".into()),
+            next_upload_id_marker: Some("sensitive-page-upload-id-777".into()),
+        };
+        let page_debug = format!("{page:?}");
+        assert!(
+            !page_debug.contains("sensitive-page-upload-id-777"),
+            "MultipartUploadPage leaked upload_id in Debug: {page_debug}"
+        );
     }
 }

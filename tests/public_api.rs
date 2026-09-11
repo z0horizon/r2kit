@@ -187,3 +187,22 @@ fn persistence_record_and_receipt_support_serde_without_leaking_in_debug() {
     let record = serde_json::from_value(unsupported).unwrap();
     assert!(MultipartSessionSnapshot::from_persistence_record(record).is_err());
 }
+
+#[test]
+fn list_multipart_uploads_builder_debug_redacts_upload_id_marker() {
+    let config = r2kit::R2Config::builder()
+        .account_id("0123456789abcdef0123456789abcdef")
+        .access_key_id("test")
+        .secret_access_key("test")
+        .build()
+        .unwrap();
+    let bucket = r2kit::R2Client::new(config).bucket("test-bucket").unwrap();
+    let builder = bucket
+        .list_multipart_uploads()
+        .upload_id_marker("sensitive-upload-id-marker-98765");
+    let debug = format!("{builder:?}");
+    assert!(
+        !debug.contains("sensitive-upload-id-marker-98765"),
+        "upload_id_marker was leaked in Debug output: {debug}"
+    );
+}

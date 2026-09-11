@@ -549,3 +549,31 @@ async fn live_list_multipart_uploads_and_cleanup() {
 
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires explicit bucket-scoped R2 credentials"]
+async fn live_list_buckets_and_bucket_exists() {
+    let client = live_client();
+    let bucket_name = "r2kit-live-tests";
+
+    let exists = client
+        .bucket_exists(bucket_name)
+        .await
+        .expect("bucket_exists should succeed for existing bucket");
+    assert!(exists, "expected dedicated live bucket to exist");
+
+    let not_exists = client
+        .bucket_exists("r2kit-nonexistent-bucket-99999")
+        .await
+        .expect("bucket_exists should succeed for non-existent bucket");
+    assert!(!not_exists, "expected non-existent bucket to return false");
+
+    let buckets = client
+        .list_buckets()
+        .await
+        .expect("list_buckets should succeed");
+    assert!(
+        buckets.iter().any(|b| b.name() == bucket_name),
+        "list_buckets should include the dedicated test bucket"
+    );
+}

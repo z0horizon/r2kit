@@ -1634,6 +1634,12 @@ impl Bucket {
         let key = key.into_object_key()?;
         types::validate_expiry(expires_in)?;
         options.validate()?;
+        if options.checksum().is_some() && options.checksum_value().is_none() {
+            return Err(Error::InvalidInput {
+                field: "checksum",
+                reason: "auto-computing checksums is only supported for in-memory bytes; provide a precomputed digest using with_checksum_value",
+            });
+        }
         if content_length > MAX_SINGLE_PUT_SIZE {
             return Err(ValidationError::SingleUploadTooLarge {
                 provided: content_length,
@@ -1752,6 +1758,12 @@ impl Bucket {
     ) -> Result<PutObjectResult, Error> {
         let key = key.into_object_key()?;
         options.validate()?;
+        if options.checksum().is_some() && options.checksum_value().is_none() {
+            return Err(Error::InvalidInput {
+                field: "checksum",
+                reason: "auto-computing checksums is only supported for in-memory bytes; provide a precomputed digest using with_checksum_value",
+            });
+        }
         if content_length > MAX_SINGLE_PUT_SIZE {
             return Err(ValidationError::SingleUploadTooLarge {
                 provided: content_length,

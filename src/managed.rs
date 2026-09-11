@@ -420,6 +420,13 @@ impl ManagedMultipartBuilder {
             return Err(ManagedUploadError::before_start(Error::Cancelled));
         }
 
+        if self.resume.is_some() {
+            return Err(ManagedUploadError::before_start(Error::InvalidInput {
+                field: "resume",
+                reason: "streaming uploads cannot resume an existing multipart session; use upload_file for resumable transfers",
+            }));
+        }
+
         let session = self
             .bucket
             .presigned_multipart(&self.key)

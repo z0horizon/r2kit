@@ -192,3 +192,32 @@ async fn pre_cancelled_upload_stream_never_starts_a_remote_session() {
     assert!(!error.was_aborted());
     assert!(error.snapshot().is_none());
 }
+
+#[tokio::test]
+async fn upload_stream_rejects_resumed_sessions() {
+    let bucket = offline_bucket();
+    let snapshot = MultipartSessionSnapshot::restore(
+        "managed-tests",
+        "stream.bin",
+        "existing-upload-id",
+        10 * 1024 * 1024,
+        5 * 1024 * 1024,
+    )
+    .unwrap();
+
+    let reader = std::io::Cursor::new(vec![0u8; 10 * 1024 * 1024]);
+    let error = bucket
+        .resume_managed_multipart(snapshot)
+        .unwrap()
+        .upload_stream(reader, 10 * 1024 * 1024)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.error(),
+        Error::InvalidInput {
+            field: "resume",
+            ..
+        }
+    ));
+}
