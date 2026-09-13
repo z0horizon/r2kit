@@ -28,6 +28,11 @@ Cargo.lock
 .env
 .env.*
 
+# Superpowers / Worktrees
+.superpowers/
+.worktrees/
+worktrees/
+
 # ══════════════════════════════════════════════════
 # Coverage / Profiling
 # ══════════════════════════════════════════════════
