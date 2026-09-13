@@ -256,6 +256,18 @@ fn multipart_session_snapshot_supports_direct_serde() {
     assert_eq!(restored.expose_upload_id(), snapshot.expose_upload_id());
     assert_eq!(restored.file_size(), snapshot.file_size());
     assert_eq!(restored.part_size(), snapshot.part_size());
+
+    // Invalid bucket name fails deserialization at trust boundary
+    let invalid_bucket = json.replace("example-bucket", "INVALID BUCKET");
+    assert!(serde_json::from_str::<MultipartSessionSnapshot>(&invalid_bucket).is_err());
+
+    // Invalid part size (< 5 MiB) fails deserialization
+    let invalid_part = json.replace(&snapshot.part_size().to_string(), "1024");
+    assert!(serde_json::from_str::<MultipartSessionSnapshot>(&invalid_part).is_err());
+
+    // Empty upload ID fails deserialization
+    let empty_upload_id = json.replace("sensitive-upload-id-123", "");
+    assert!(serde_json::from_str::<MultipartSessionSnapshot>(&empty_upload_id).is_err());
 }
 
 #[cfg(feature = "serde")]

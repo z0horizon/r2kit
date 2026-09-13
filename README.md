@@ -12,7 +12,7 @@ account endpoint, `auto` signing region, secret-safe presigned requests,
 resumable multipart sessions, and managed file uploads with bounded concurrency
 and exact retries.
 
-> **Status:** `0.3.0` introduces the Unified Transfer Manager with adaptive
+> **Status:** `0.2.1` introduces the Unified Transfer Manager with adaptive
 > file uploads, coordinated presigned upload planning, direct multipart abort,
 > and flattened listing streams, verified against live Cloudflare R2.
 

@@ -19,7 +19,7 @@ use crate::{
 
 // https://developers.cloudflare.com/r2/platform/limits/
 const MAX_MULTIPART_OBJECT_SIZE: u64 = types::MAX_MULTIPART_OBJECT_SIZE;
-const MAX_PARTS: u16 = 10_000;
+pub(crate) const MAX_PARTS: u16 = 10_000;
 
 /// A validated multipart part number in the range `1..=10_000`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -487,6 +487,10 @@ impl fmt::Debug for MultipartUploadPartRequest {
 /// Persistable state needed to resume a presigned multipart upload.
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(try_from = "MultipartSessionRecord", into = "MultipartSessionRecord")
+)]
 pub struct MultipartSessionSnapshot {
     bucket: String,
     key: String,
@@ -618,7 +622,23 @@ impl MultipartSessionSnapshot {
             part_size: self.part_size,
         }
     }
+}
 
+impl TryFrom<MultipartSessionRecord> for MultipartSessionSnapshot {
+    type Error = Error;
+
+    fn try_from(record: MultipartSessionRecord) -> Result<Self, Self::Error> {
+        Self::from_persistence_record(record)
+    }
+}
+
+impl From<MultipartSessionSnapshot> for MultipartSessionRecord {
+    fn from(snapshot: MultipartSessionSnapshot) -> Self {
+        snapshot.into_persistence_record()
+    }
+}
+
+impl MultipartSessionSnapshot {
     /// Deliberately exposes the upload ID for persistence.
     #[must_use]
     pub fn expose_upload_id(&self) -> &str {

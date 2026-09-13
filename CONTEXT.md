@@ -25,7 +25,7 @@ An in-progress multipart upload workflow tracking upload ID, parts plan, and com
 _Avoid_: MultipartUpload, UploadSession
 
 **TransferManager**:
-An operational engine coordinating object transfers with adaptive strategy selection, concurrency pools, and memory budgeting.
+An operational engine coordinating object transfers with adaptive strategy selection, concurrency pools, and memory budgeting (in 0.2.1 surfaced via `UploadFileBuilder` and `Bucket::upload_file`).
 _Avoid_: TransferService, UploadQueue, TransferPool
 
 **UploadThreshold**:

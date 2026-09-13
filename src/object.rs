@@ -1750,6 +1750,11 @@ impl Bucket {
     /// generates a single presigned PUT request ([`PresignedUploadPlan::Single`]).
     /// If `file_size` meets or exceeds the threshold, initiates a presigned multipart upload
     /// ([`PresignedUploadPlan::Multipart`]).
+    ///
+    /// # Protocol Notes
+    /// Conditional headers (such as `if_match`) and whole-object checksums in `options` are only
+    /// supported on single PUT uploads. For files meeting or exceeding the multipart threshold,
+    /// multipart session initiation will reject these options with [`Error::InvalidInput`].
     pub async fn presign_upload_with_options(
         &self,
         key: impl IntoObjectKey,
@@ -1766,10 +1771,12 @@ impl Bucket {
                 .await?;
             Ok(PresignedUploadPlan::Single(put))
         } else {
+            let min_part_for_file = file_size.div_ceil(u64::from(crate::multipart::MAX_PARTS));
+            let part_size = min_part_for_file.max(crate::types::UploadThreshold::DEFAULT_BYTES);
             let session = self
                 .presigned_multipart(&key)?
                 .file_size(file_size)
-                .part_size(crate::types::UploadThreshold::DEFAULT_BYTES)
+                .part_size(part_size)
                 .upload_options(options)
                 .create()
                 .await?;

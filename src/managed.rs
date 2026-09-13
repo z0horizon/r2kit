@@ -1122,6 +1122,11 @@ impl UploadFileBuilder {
     }
 
     /// Sets typed upload options stored on the completed object.
+    ///
+    /// # Protocol Notes
+    /// Conditional headers (such as `if_match`) and whole-object checksums are only supported
+    /// when the transfer resolves to a single PUT (sub-threshold or 0-byte files). If specified
+    /// for a file that executes via multipart upload, execution will return [`Error::InvalidInput`].
     #[must_use]
     pub fn options(mut self, options: ObjectUploadOptions) -> Self {
         self.options = options;
@@ -1230,10 +1235,9 @@ impl UploadFileBuilder {
         self
     }
 
-    /// Executes the adaptive file upload.
-    pub async fn send(self) -> Result<TransferResult, Error> {
-        let key = self.key.clone()?;
-
+    fn validate(&self) -> Result<(), Error> {
+        self.options.validate()?;
+        types::validate_part_size(self.part_size)?;
         if self.concurrency == 0 || self.concurrency > MAX_CONCURRENCY {
             return Err(ValidationError::ConcurrencyOutOfRange {
                 provided: self.concurrency,
@@ -1250,6 +1254,21 @@ impl UploadFileBuilder {
             }
             .into());
         }
+        let required = required_buffer_bytes(self.part_size, self.concurrency);
+        if required > self.max_buffered_bytes {
+            return Err(ValidationError::ManagedMemoryBudgetExceeded {
+                required,
+                max: self.max_buffered_bytes,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Executes the adaptive file upload.
+    pub async fn send(self) -> Result<TransferResult, Error> {
+        self.validate()?;
+        let key = self.key.clone()?;
 
         if self
             .cancellation
@@ -1274,7 +1293,6 @@ impl UploadFileBuilder {
         let source_fingerprint = SourceFileFingerprint::from_metadata(&metadata);
 
         if file_size == 0 {
-            self.options.validate()?;
             observability::managed_upload("start", 0, 1, 1);
             let put_fut =
                 self.bucket
@@ -1298,6 +1316,7 @@ impl UploadFileBuilder {
                     operation: "metadata",
                 })?;
             if !source_fingerprint.matches(&final_metadata) {
+                let _ = self.bucket.delete(&key).await;
                 return Err(Error::InvalidInput {
                     field: "path",
                     reason: "file changed during upload",
@@ -1322,7 +1341,6 @@ impl UploadFileBuilder {
         }
 
         if file_size < self.threshold.get() {
-            self.options.validate()?;
             observability::managed_upload("start", file_size, 1, 1);
             let file = tokio::fs::File::open(&self.path)
                 .await
@@ -1357,6 +1375,7 @@ impl UploadFileBuilder {
                     operation: "metadata",
                 })?;
             if !source_fingerprint.matches(&final_metadata) {
+                let _ = self.bucket.delete(&key).await;
                 return Err(Error::InvalidInput {
                     field: "path",
                     reason: "file changed during upload",
@@ -1380,10 +1399,12 @@ impl UploadFileBuilder {
             });
         }
 
+        let min_part_for_file = file_size.div_ceil(u64::from(crate::multipart::MAX_PARTS));
+        let effective_part_size = self.part_size.max(min_part_for_file);
         let mut mp_builder = self.bucket.managed_multipart(&key)?;
         mp_builder = mp_builder
             .upload_options(self.options.clone())
-            .part_size(self.part_size)
+            .part_size(effective_part_size)
             .concurrency(self.concurrency)
             .max_attempts(self.max_attempts)
             .max_buffered_bytes(self.max_buffered_bytes);

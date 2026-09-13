@@ -16,9 +16,9 @@ Accepted
 ## Consequences
 
 - **Two-Tiered Transfer Architecture:**
-  - `Bucket::upload_file(key, path)` and `Bucket::upload(key)` provide fluent, adaptive uploads automatically switching between atomic `PutObject` and pipelined multipart transfers based on `UploadThreshold` (validated >= 5 MiB, defaulting to 8 MiB).
+  - `Bucket::upload_file(key, path)` provides fluent, adaptive file uploads automatically switching between atomic `PutObject` and pipelined multipart transfers based on `UploadThreshold` (validated >= 5 MiB, defaulting to 8 MiB).
   - 0-byte and sub-threshold files transparently execute via atomic single-part PUT operations without throwing multipart plan errors.
-  - `TransferManager` provides a reusable engine for advanced callers requiring cross-transfer concurrency limits and global memory budgeting.
+  - In 0.2.1, the adaptive transfer engine is encapsulated in `UploadFileBuilder`; a standalone `TransferManager` handle for cross-transfer concurrency coordination and global multi-file pools is reserved for a future release.
 - **Coordinated Presigned Uploads:**
   - `Bucket::presign_upload(key, size, expires_in)` returns a typed `PresignedUploadPlan` (`Single` vs `Multipart`), eliminating duplicated threshold and signing logic in web backends coordinating browser-to-R2 transfers.
 - **Direct Multipart Abort:**

@@ -622,3 +622,48 @@ async fn upload_file_honors_custom_threshold() {
         TransferStrategyUsed::Multipart { part_count: 2 }
     );
 }
+
+#[tokio::test]
+async fn upload_file_validates_limits_and_options_before_file_io() {
+    let bucket = offline_bucket();
+
+    // Invalid part size (< 5 MiB) fails before checking path
+    let err_part = bucket
+        .upload_file("key.bin", "non_existent_file.bin")
+        .part_size(1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err_part,
+        Error::Validation(ValidationError::PartSizeOutOfRange { provided: 1024, .. })
+    ));
+
+    // Exceeded memory budget fails before checking path
+    let err_mem = bucket
+        .upload_file("key.bin", "non_existent_file.bin")
+        .part_size(10 * 1024 * 1024)
+        .concurrency(10)
+        .max_buffered_bytes(5 * 1024 * 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err_mem,
+        Error::Validation(ValidationError::ManagedMemoryBudgetExceeded { .. })
+    ));
+
+    // Invalid upload options fail before checking path
+    let err_opt = bucket
+        .upload_file("key.bin", "non_existent_file.bin")
+        .upload_options(
+            r2kit::ObjectUploadOptions::new().with_custom_metadata("Invalid Key!", "val"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err_opt,
+        Error::InvalidInput {
+            field: "custom_metadata",
+            ..
+        }
+    ));
+}

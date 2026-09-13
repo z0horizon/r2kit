@@ -52,7 +52,7 @@ if file_size == 0 {
 }
 ```
 
-### After (0.3.0)
+### After (0.2.1)
 
 Use `bucket.upload_file` for all file transfers. It adaptively determines the optimal
 transfer strategy:
@@ -104,7 +104,7 @@ let session = bucket.resume_presigned_multipart(snapshot)?;
 session.abort().await?;
 ```
 
-### After (0.3.0)
+### After (0.2.1)
 
 Call `bucket.abort_multipart_upload` directly with the key and upload ID:
 
@@ -141,7 +141,7 @@ let plan = if file_size < 8 * 1024 * 1024 {
 };
 ```
 
-### After (0.3.0)
+### After (0.2.1)
 
 Use `bucket.presign_upload` to obtain a `PresignedUploadPlan`:
 
@@ -194,7 +194,7 @@ match err {
 }
 ```
 
-### After (0.3.0)
+### After (0.2.1)
 
 Use the canonical `err.is_not_found()` helper method:
 
@@ -226,7 +226,7 @@ let options = r2kit::ObjectUploadOptions::new()
     .with_content_type(mime);
 ```
 
-### After (0.3.0)
+### After (0.2.1)
 
 Pass `&str`, `String`, or `mime::Mime` directly to `with_content_type` or `UploadFileBuilder::content_type`:
 
@@ -271,7 +271,7 @@ for page in pages {
 }
 ```
 
-### After (0.3.0)
+### After (0.2.1)
 
 Use `into_stream()` (or `into_objects()`) to obtain a flattened stream of `Result<ObjectItem, Error>`:
 

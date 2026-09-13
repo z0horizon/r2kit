@@ -664,3 +664,65 @@ async fn presign_upload_validates_expiry_offline_for_both_branches() {
         }) if provided == Duration::ZERO
     ));
 }
+
+#[tokio::test]
+async fn presign_upload_scales_part_size_for_very_large_files() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Bucket>contract-tests</Bucket>
+    <Key>huge.tar</Key>
+    <UploadId>huge-upload-id-12345</UploadId>
+</InitiateMultipartUploadResult>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    // 100 GiB file would require > 10,000 parts if 8 MiB part size was used (12,800 parts)
+    let large_size = 100 * 1024 * 1024 * 1024;
+    let res = bucket
+        .presign_upload("huge.tar", large_size, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let _ = server.join();
+
+    match res {
+        r2kit::PresignedUploadPlan::Multipart(plan) => {
+            assert!(plan.part_count() <= 10_000);
+            assert!(plan.part_size() > r2kit::UploadThreshold::DEFAULT_BYTES);
+            assert_eq!(plan.part_count(), 10_000);
+        }
+        r2kit::PresignedUploadPlan::Single(_) => panic!("expected multipart plan for 100 GiB"),
+    }
+}
