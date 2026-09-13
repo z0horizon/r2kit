@@ -11,15 +11,17 @@ use aws_sdk_s3::{
 };
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, future::Either, stream};
 use headers::Header;
 use mime::Mime;
 use oxilangtag::LanguageTag;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
 use crate::{
-    Bucket, BucketName, Error, IntoBucketName, IntoObjectKey, ObjectKey, PresignedRequest,
-    ValidationError, types,
+    Bucket, BucketName, Error, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey,
+    PresignedRequest, UploadFileBuilder, ValidationError,
+    multipart::{PresignedMultipartPlan, PresignedUploadPlan},
+    types,
 };
 
 macro_rules! map_object_error {
@@ -141,7 +143,7 @@ pub(crate) fn compute_checksum(bytes: &[u8], algorithm: ChecksumAlgorithm) -> St
 /// not on individual part requests.
 #[derive(Clone, Debug, Default)]
 pub struct ObjectUploadOptions {
-    content_type: Option<Mime>,
+    content_type: Option<Result<Mime, Error>>,
     cache_control: Option<headers::CacheControl>,
     content_disposition: Option<String>,
     content_encoding: Option<String>,
@@ -164,7 +166,10 @@ impl ObjectUploadOptions {
     /// Returns the configured media type.
     #[must_use]
     pub const fn content_type(&self) -> Option<&Mime> {
-        self.content_type.as_ref()
+        match &self.content_type {
+            Some(Ok(mime)) => Some(mime),
+            _ => None,
+        }
     }
 
     /// Returns the configured cache policy.
@@ -247,8 +252,8 @@ impl ObjectUploadOptions {
 
     /// Returns a copy configured with this MIME media type.
     #[must_use]
-    pub fn with_content_type(mut self, value: Mime) -> Self {
-        self.content_type = Some(value);
+    pub fn with_content_type(mut self, value: impl IntoContentType) -> Self {
+        self.content_type = Some(value.into_content_type());
         self
     }
 
@@ -334,7 +339,7 @@ impl ObjectUploadOptions {
     }
 
     pub(crate) fn apply_to<T: SetObjectMetadata>(&self, req: T) -> T {
-        req.set_content_type(self.content_type.as_ref().map(ToString::to_string))
+        req.set_content_type(self.content_type().map(ToString::to_string))
             .set_cache_control(self.cache_control.as_ref().map(encode_header))
             .set_content_disposition(self.content_disposition.clone())
             .set_content_encoding(self.content_encoding.clone())
@@ -360,6 +365,9 @@ impl ObjectUploadOptions {
     }
 
     pub(crate) fn validate(&self) -> Result<(), Error> {
+        if let Some(res) = &self.content_type {
+            res.as_ref().map_err(Clone::clone)?;
+        }
         for (field, value) in [
             ("content_disposition", self.content_disposition.as_deref()),
             ("content_encoding", self.content_encoding.as_deref()),
@@ -391,8 +399,7 @@ impl ObjectUploadOptions {
         }
 
         let mut total_bytes = self
-            .content_type
-            .as_ref()
+            .content_type()
             .map_or(0, |value| "content-type".len() + value.to_string().len())
             + self.cache_control.as_ref().map_or(0, |value| {
                 "cache-control".len() + encode_header(value).len()
@@ -735,7 +742,22 @@ impl PresignedPutObject {
     pub fn into_request(self) -> PresignedRequest {
         self.request
     }
+
+    /// Returns the signed URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.request.as_str()
+    }
+
+    /// Consumes this value and returns the signed URL as an owned string.
+    #[must_use]
+    pub fn into_url_string(self) -> String {
+        self.request.into_url_string()
+    }
 }
+
+/// Alias for an object summary returned by a bucket listing.
+pub type ObjectItem = ObjectSummary;
 
 /// One object returned by a bucket listing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -880,6 +902,12 @@ impl ObjectPage {
     #[must_use]
     pub fn objects(&self) -> &[ObjectSummary] {
         &self.objects
+    }
+
+    /// Consumes the page and returns its objects.
+    #[must_use]
+    pub fn into_objects(self) -> Vec<ObjectSummary> {
+        self.objects
     }
 
     /// Returns rolled-up prefixes when a delimiter was requested.
@@ -1061,6 +1089,26 @@ impl ListObjectsBuilder {
             let state = next_token.map(|token| next_builder.continuation_token(token));
             Ok(Some((page, state)))
         })
+    }
+
+    /// Streams individual object summaries across all pages until R2 reports that
+    /// the listing is complete.
+    pub fn into_stream(self) -> impl Stream<Item = Result<ObjectItem, Error>> + Send {
+        self.into_pages()
+            .map(|page_res| match page_res {
+                Ok(page) => Either::Left(stream::iter(page.into_objects().into_iter().map(Ok))),
+                Err(err) => Either::Right(stream::iter(std::iter::once(Err(err)))),
+            })
+            .flatten()
+    }
+
+    /// Streams individual object summaries across all pages until R2 reports that
+    /// the listing is complete.
+    ///
+    /// Alias for [`into_stream`](Self::into_stream).
+    #[inline]
+    pub fn into_objects(self) -> impl Stream<Item = Result<ObjectItem, Error>> + Send {
+        self.into_stream()
     }
 }
 
@@ -1682,6 +1730,62 @@ impl Bucket {
         })
     }
 
+    /// Creates a coordinated presigned upload plan for an object of known size.
+    ///
+    /// Automatically selects between a single presigned PUT and a presigned multipart
+    /// upload session based on the default threshold ([`crate::UploadThreshold::DEFAULT_BYTES`]).
+    pub async fn presign_upload(
+        &self,
+        key: impl IntoObjectKey,
+        file_size: u64,
+        expires_in: Duration,
+    ) -> Result<PresignedUploadPlan, Error> {
+        self.presign_upload_with_options(key, file_size, expires_in, ObjectUploadOptions::default())
+            .await
+    }
+
+    /// Creates a coordinated presigned upload plan with custom upload options.
+    ///
+    /// If `file_size` is smaller than the upload threshold (or 0 bytes),
+    /// generates a single presigned PUT request ([`PresignedUploadPlan::Single`]).
+    /// If `file_size` meets or exceeds the threshold, initiates a presigned multipart upload
+    /// ([`PresignedUploadPlan::Multipart`]).
+    ///
+    /// # Protocol Notes
+    /// Conditional headers (such as `if_match`) and whole-object checksums in `options` are only
+    /// supported on single PUT uploads. For files meeting or exceeding the multipart threshold,
+    /// multipart session initiation will reject these options with [`Error::InvalidInput`].
+    pub async fn presign_upload_with_options(
+        &self,
+        key: impl IntoObjectKey,
+        file_size: u64,
+        expires_in: Duration,
+        options: ObjectUploadOptions,
+    ) -> Result<PresignedUploadPlan, Error> {
+        types::validate_expiry(expires_in)?;
+        let key = key.into_object_key()?;
+        let threshold = crate::types::UploadThreshold::default().get();
+        if file_size < threshold {
+            let put = self
+                .presign_put_with_options(&key, file_size, expires_in, options)
+                .await?;
+            Ok(PresignedUploadPlan::Single(put))
+        } else {
+            let min_part_for_file = file_size.div_ceil(u64::from(crate::multipart::MAX_PARTS));
+            let part_size = min_part_for_file.max(crate::types::UploadThreshold::DEFAULT_BYTES);
+            let session = self
+                .presigned_multipart(&key)?
+                .file_size(file_size)
+                .part_size(part_size)
+                .upload_options(options)
+                .create()
+                .await?;
+            Ok(PresignedUploadPlan::Multipart(
+                PresignedMultipartPlan::from_session(session),
+            ))
+        }
+    }
+
     /// Uploads an in-memory object with a single R2 request.
     pub async fn put_bytes(
         &self,
@@ -1859,6 +1963,19 @@ impl Bucket {
         Ok(metadata)
     }
 
+    /// Starts an adaptive file upload that automatically selects between a single PUT
+    /// and managed multipart upload based on file size and configured threshold.
+    ///
+    /// The returned builder supports setting upload options, threshold, concurrency,
+    /// progress callbacks, and cancellation signals.
+    pub fn upload_file(
+        &self,
+        key: impl IntoObjectKey,
+        path: impl AsRef<std::path::Path>,
+    ) -> UploadFileBuilder {
+        UploadFileBuilder::new(self.clone(), key, path)
+    }
+
     /// Fetches object metadata without downloading its body.
     pub async fn head(&self, key: impl IntoObjectKey) -> Result<ObjectMetadata, Error> {
         self.head_object(key).send().await
@@ -1875,6 +1992,42 @@ impl Bucket {
             .send()
             .await
             .map_err(|error| Error::remote("DeleteObject", &error))?;
+        Ok(())
+    }
+
+    /// Aborts an in-progress or orphaned multipart upload directly.
+    ///
+    /// This method calls S3/R2 `AbortMultipartUpload` without requiring a
+    /// [`MultipartSessionSnapshot`](crate::MultipartSessionSnapshot) or prior
+    /// knowledge of part sizing or file dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] if `key` or `upload_id` is empty.
+    /// Returns [`Error::NotFound`] if the specified upload or object does not exist.
+    /// Returns [`Error::Remote`] on other Cloudflare R2 service failures.
+    pub async fn abort_multipart_upload(
+        &self,
+        key: impl IntoObjectKey,
+        upload_id: impl Into<String>,
+    ) -> Result<(), Error> {
+        let key = key.into_object_key()?;
+        let upload_id = upload_id.into();
+        if upload_id.trim().is_empty() {
+            return Err(Error::InvalidInput {
+                field: "upload_id",
+                reason: "must not be empty",
+            });
+        }
+        self.client
+            .as_sdk()
+            .abort_multipart_upload()
+            .bucket(self.name())
+            .key(key.as_str())
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|err| Error::from_sdk("AbortMultipartUpload", &err))?;
         Ok(())
     }
 

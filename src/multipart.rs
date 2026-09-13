@@ -13,12 +13,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{Stream, stream};
 
 use crate::{
-    Bucket, Error, IntoBucketName, IntoObjectKey, ObjectUploadOptions, ValidationError, types,
+    Bucket, Error, IntoBucketName, IntoContentType, IntoObjectKey, ObjectUploadOptions,
+    ValidationError, types,
 };
 
 // https://developers.cloudflare.com/r2/platform/limits/
-const MAX_MULTIPART_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024 - 5 * 1024 * 1024 * 1024;
-const MAX_PARTS: u16 = 10_000;
+const MAX_MULTIPART_OBJECT_SIZE: u64 = types::MAX_MULTIPART_OBJECT_SIZE;
+pub(crate) const MAX_PARTS: u16 = 10_000;
 
 /// A validated multipart part number in the range `1..=10_000`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -294,6 +295,18 @@ impl PresignedRequest {
             self.required_headers,
         )
     }
+
+    /// Returns the signed URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.url.expose()
+    }
+
+    /// Consumes this value and returns the signed URL as an owned string.
+    #[must_use]
+    pub fn into_url_string(self) -> String {
+        self.url.into_exposed_string()
+    }
 }
 
 impl fmt::Debug for PresignedRequest {
@@ -350,6 +363,18 @@ impl PresignedUploadPart {
     #[must_use]
     pub fn into_request(self) -> PresignedRequest {
         self.request
+    }
+
+    /// Returns the bearer presigned URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.request.as_str()
+    }
+
+    /// Consumes the part wrapper and returns the bearer presigned URL as an owned string.
+    #[must_use]
+    pub fn into_url_string(self) -> String {
+        self.request.into_url_string()
     }
 
     /// Deliberately exposes the bearer request as a serializable protocol DTO.
@@ -460,7 +485,12 @@ impl fmt::Debug for MultipartUploadPartRequest {
 }
 
 /// Persistable state needed to resume a presigned multipart upload.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(try_from = "MultipartSessionRecord", into = "MultipartSessionRecord")
+)]
 pub struct MultipartSessionSnapshot {
     bucket: String,
     key: String,
@@ -592,7 +622,23 @@ impl MultipartSessionSnapshot {
             part_size: self.part_size,
         }
     }
+}
 
+impl TryFrom<MultipartSessionRecord> for MultipartSessionSnapshot {
+    type Error = Error;
+
+    fn try_from(record: MultipartSessionRecord) -> Result<Self, Self::Error> {
+        Self::from_persistence_record(record)
+    }
+}
+
+impl From<MultipartSessionSnapshot> for MultipartSessionRecord {
+    fn from(snapshot: MultipartSessionSnapshot) -> Self {
+        snapshot.into_persistence_record()
+    }
+}
+
+impl MultipartSessionSnapshot {
     /// Deliberately exposes the upload ID for persistence.
     #[must_use]
     pub fn expose_upload_id(&self) -> &str {
@@ -746,7 +792,7 @@ impl PresignedMultipartBuilder {
 
     /// Sets the completed object's MIME media type.
     #[must_use]
-    pub fn content_type(mut self, value: mime::Mime) -> Self {
+    pub fn content_type(mut self, value: impl IntoContentType) -> Self {
         self.options = self.options.with_content_type(value);
         self
     }
@@ -892,6 +938,12 @@ pub struct PresignedMultipart {
 }
 
 impl PresignedMultipart {
+    /// Returns the upload ID for this multipart session.
+    #[must_use]
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
     /// Returns the number of planned parts.
     #[must_use]
     pub const fn part_count(&self) -> u16 {
@@ -1148,6 +1200,153 @@ impl fmt::Debug for PresignedMultipart {
             .field("upload_id", &"[REDACTED]")
             .field("plan", &self.plan)
             .finish()
+    }
+}
+
+/// An initiated presigned multipart upload plan.
+///
+/// Wraps an active multipart session and provides convenient access to session state,
+/// upload ID, part counts, and individual part presigning methods.
+#[derive(Clone)]
+pub struct PresignedMultipartPlan {
+    session: PresignedMultipart,
+}
+
+impl PresignedMultipartPlan {
+    /// Creates a new presigned multipart plan from an active session.
+    #[must_use]
+    pub fn from_session(session: PresignedMultipart) -> Self {
+        Self { session }
+    }
+
+    /// Returns a reference to the active multipart session.
+    #[must_use]
+    pub fn session(&self) -> &PresignedMultipart {
+        &self.session
+    }
+
+    /// Consumes the plan and returns the underlying multipart session.
+    #[must_use]
+    pub fn into_session(self) -> PresignedMultipart {
+        self.session
+    }
+
+    /// Returns the upload ID for this multipart session.
+    #[must_use]
+    pub fn upload_id(&self) -> &str {
+        &self.session.upload_id
+    }
+
+    /// Returns the number of planned parts.
+    #[must_use]
+    pub const fn part_count(&self) -> u16 {
+        self.session.part_count()
+    }
+
+    /// Returns the planned part size in bytes.
+    #[must_use]
+    pub const fn part_size(&self) -> u64 {
+        self.session.plan.part_size
+    }
+
+    /// Returns the total expected file size in bytes.
+    #[must_use]
+    pub const fn file_size(&self) -> u64 {
+        self.session.plan.file_size
+    }
+
+    /// Creates a temporary signed PUT request for one part.
+    pub async fn presign_part(
+        &self,
+        number: PartNumber,
+        expires_in: Duration,
+    ) -> Result<PresignedUploadPart, Error> {
+        self.session.presign_part(number, expires_in).await
+    }
+
+    /// Creates a signed PUT request with `Content-MD5` verification for one part.
+    pub async fn presign_part_with_md5(
+        &self,
+        number: PartNumber,
+        content_md5: PartMd5,
+        expires_in: Duration,
+    ) -> Result<PresignedUploadPart, Error> {
+        self.session
+            .presign_part_with_md5(number, content_md5, expires_in)
+            .await
+    }
+}
+
+impl fmt::Debug for PresignedMultipartPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PresignedMultipartPlan")
+            .field("upload_id", &"[REDACTED]")
+            .field("part_count", &self.session.part_count())
+            .field("part_size", &self.session.plan.part_size)
+            .field("file_size", &self.session.plan.file_size)
+            .finish()
+    }
+}
+
+/// A presigned upload coordination plan.
+///
+/// Automatically chooses between a single presigned PUT request for small objects
+/// and an initiated multipart upload session for objects meeting or exceeding the threshold.
+#[derive(Clone, Debug)]
+pub enum PresignedUploadPlan {
+    /// Single PUT request for objects smaller than the upload threshold.
+    Single(crate::object::PresignedPutObject),
+    /// Multipart upload session for objects meeting or exceeding the upload threshold.
+    Multipart(PresignedMultipartPlan),
+}
+
+impl PresignedUploadPlan {
+    /// Returns `true` if this upload plan requires multipart coordination.
+    #[must_use]
+    pub fn is_multipart(&self) -> bool {
+        matches!(self, Self::Multipart(_))
+    }
+
+    /// Returns `true` if this upload plan is a single PUT request.
+    #[must_use]
+    pub fn is_single(&self) -> bool {
+        matches!(self, Self::Single(_))
+    }
+
+    /// Returns a reference to the single PUT object if this plan is [`Self::Single`].
+    #[must_use]
+    pub fn as_single(&self) -> Option<&crate::object::PresignedPutObject> {
+        match self {
+            Self::Single(put) => Some(put),
+            Self::Multipart(_) => None,
+        }
+    }
+
+    /// Returns a reference to the multipart plan if this plan is [`Self::Multipart`].
+    #[must_use]
+    pub fn as_multipart(&self) -> Option<&PresignedMultipartPlan> {
+        match self {
+            Self::Single(_) => None,
+            Self::Multipart(plan) => Some(plan),
+        }
+    }
+
+    /// Consumes the plan, returning the single PUT object if applicable.
+    #[must_use]
+    pub fn single(self) -> Option<crate::object::PresignedPutObject> {
+        match self {
+            Self::Single(put) => Some(put),
+            Self::Multipart(_) => None,
+        }
+    }
+
+    /// Consumes the plan, returning the multipart plan if applicable.
+    #[must_use]
+    pub fn multipart(self) -> Option<PresignedMultipartPlan> {
+        match self {
+            Self::Single(_) => None,
+            Self::Multipart(plan) => Some(plan),
+        }
     }
 }
 

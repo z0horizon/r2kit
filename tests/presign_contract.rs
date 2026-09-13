@@ -51,11 +51,15 @@ async fn presigns_upload_part_without_exposing_secrets_in_debug() {
     assert!(exposed.contains("partNumber=2"));
     assert!(exposed.contains("uploadId=offline-upload-id"));
     assert!(exposed.contains("X-Amz-Signature="));
+    assert_eq!(part.as_str(), exposed);
 
     let debug = format!("{part:?}");
     assert!(!debug.contains("X-Amz-Signature"));
     assert!(!debug.contains("contract-access-key"));
     assert!(!debug.contains("contract-session-token"));
+
+    let expected = exposed.to_string();
+    assert_eq!(part.into_url_string(), expected);
 }
 
 #[tokio::test]
@@ -369,4 +373,356 @@ async fn presigned_multipart_rejects_checksum_and_conditional_headers() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn presigned_requests_support_into_content_type_variants() {
+    let bucket = offline_bucket();
+
+    // 1. &str
+    let opts_str = ObjectUploadOptions::new().with_content_type("application/json");
+    let put_str = bucket
+        .presign_put_with_options("test.json", 100, Duration::from_secs(900), opts_str)
+        .await
+        .unwrap();
+    let headers: Vec<_> = put_str.request().required_headers().collect();
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && *v == "application/json")
+    );
+
+    // 2. String
+    let opts_string = ObjectUploadOptions::new().with_content_type(String::from("text/plain"));
+    let put_string = bucket
+        .presign_put_with_options("test.txt", 100, Duration::from_secs(900), opts_string)
+        .await
+        .unwrap();
+    let headers: Vec<_> = put_string.request().required_headers().collect();
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && *v == "text/plain")
+    );
+
+    // 3. mime::Mime
+    let opts_mime = ObjectUploadOptions::new().with_content_type(mime::APPLICATION_OCTET_STREAM);
+    let put_mime = bucket
+        .presign_put_with_options("test.bin", 100, Duration::from_secs(900), opts_mime)
+        .await
+        .unwrap();
+    let headers: Vec<_> = put_mime.request().required_headers().collect();
+    assert!(
+        headers.iter().any(
+            |(k, v)| k.eq_ignore_ascii_case("content-type") && *v == "application/octet-stream"
+        )
+    );
+
+    // PresignedMultipartBuilder.content_type variants
+    let _b1 = bucket
+        .presigned_multipart("test.json")
+        .unwrap()
+        .content_type("application/json");
+    let _b2 = bucket
+        .presigned_multipart("test.txt")
+        .unwrap()
+        .content_type(String::from("text/plain"));
+    let _b3 = bucket
+        .presigned_multipart("test.bin")
+        .unwrap()
+        .content_type(mime::APPLICATION_OCTET_STREAM);
+}
+
+#[tokio::test]
+async fn into_content_type_rejects_invalid_mime_offline() {
+    let bucket = offline_bucket();
+    let opts_invalid = ObjectUploadOptions::new().with_content_type("not a valid mime type");
+    let result = bucket
+        .presign_put_with_options("test.bin", 100, Duration::from_secs(900), opts_invalid)
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "content_type",
+            ..
+        }
+    ));
+
+    let result_mp = bucket
+        .presigned_multipart("test.bin")
+        .unwrap()
+        .file_size(10 * 1024 * 1024)
+        .part_size_mib(5)
+        .content_type("invalid mime type")
+        .create()
+        .await;
+    assert!(matches!(
+        result_mp.unwrap_err(),
+        Error::InvalidInput {
+            field: "content_type",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn presigned_url_accessors_expose_url_while_redacting_debug() {
+    let bucket = offline_bucket();
+    let put = bucket
+        .presign_put("photos/vacation.jpg", 1024, Duration::from_secs(900))
+        .await
+        .unwrap();
+
+    // Test PresignedPutObject accessors
+    let url_slice: &str = put.as_str();
+    assert!(url_slice.starts_with("https://"));
+    assert!(url_slice.contains("X-Amz-Signature="));
+    assert!(url_slice.contains("photos/vacation.jpg"));
+
+    // Debug on PresignedPutObject should redact the URL
+    let put_debug = format!("{put:?}");
+    assert!(!put_debug.contains("X-Amz-Signature="));
+    assert!(put_debug.contains("[REDACTED PRESIGNED URL]"));
+
+    // PresignedRequest accessors
+    let req = put.request();
+    let req_url_slice: &str = req.as_str();
+    assert_eq!(req_url_slice, url_slice);
+
+    let req_debug = format!("{req:?}");
+    assert!(!req_debug.contains("X-Amz-Signature="));
+    assert!(req_debug.contains("[REDACTED PRESIGNED URL]"));
+
+    // Test into_url_string on PresignedRequest
+    let req_cloned = req.clone();
+    let req_url_str: String = req_cloned.into_url_string();
+    assert_eq!(req_url_str, url_slice);
+
+    // Test into_url_string on PresignedPutObject
+    let expected_url = url_slice.to_string();
+    let put_url_str: String = put.into_url_string();
+    assert_eq!(put_url_str, expected_url);
+}
+
+#[test]
+fn upload_threshold_validates_offline() {
+    let result = r2kit::UploadThreshold::new(4 * 1024 * 1024);
+    assert!(matches!(
+        result,
+        Err(ValidationError::PartSizeOutOfRange {
+            provided: 4_194_304,
+            min: 5_242_880,
+            ..
+        })
+    ));
+
+    let valid = r2kit::UploadThreshold::new(8 * 1024 * 1024).unwrap();
+    assert_eq!(valid.get(), 8 * 1024 * 1024);
+    assert_eq!(r2kit::UploadThreshold::default().get(), 8 * 1024 * 1024);
+
+    let too_large = r2kit::UploadThreshold::new(u64::MAX);
+    assert!(matches!(
+        too_large,
+        Err(ValidationError::PartSizeOutOfRange { .. })
+    ));
+}
+
+#[tokio::test]
+async fn presign_upload_returns_single_for_sub_threshold() {
+    let bucket = offline_bucket();
+    let plan = bucket
+        .presign_upload("small.txt", 2 * 1024 * 1024, Duration::from_secs(900))
+        .await
+        .unwrap();
+
+    assert!(!plan.is_multipart());
+    match plan {
+        r2kit::PresignedUploadPlan::Single(put) => {
+            assert_eq!(put.content_length(), 2 * 1024 * 1024);
+            assert!(put.as_str().contains("small.txt"));
+        }
+        r2kit::PresignedUploadPlan::Multipart(_) => panic!("expected single PUT plan"),
+    }
+}
+
+#[tokio::test]
+async fn presign_upload_handles_zero_byte_as_single() {
+    let bucket = offline_bucket();
+    let plan = bucket
+        .presign_upload("empty.txt", 0, Duration::from_secs(900))
+        .await
+        .unwrap();
+
+    assert!(!plan.is_multipart());
+    match plan {
+        r2kit::PresignedUploadPlan::Single(put) => {
+            assert_eq!(put.content_length(), 0);
+            assert!(put.as_str().contains("empty.txt"));
+        }
+        r2kit::PresignedUploadPlan::Multipart(_) => panic!("expected single PUT plan"),
+    }
+}
+
+#[tokio::test]
+async fn presign_upload_returns_multipart_for_above_threshold() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("POST "),
+                "expected POST request, got: {req}"
+            );
+            assert!(req.contains("uploads"), "expected ?uploads query parameter");
+
+            let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Bucket>contract-tests</Bucket>
+    <Key>large.bin</Key>
+    <UploadId>offline-upload-id-12345</UploadId>
+</InitiateMultipartUploadResult>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    let plan = bucket
+        .presign_upload("large.bin", 12 * 1024 * 1024, Duration::from_secs(900))
+        .await
+        .unwrap();
+    let _ = server.join();
+
+    assert!(plan.is_multipart());
+    match plan {
+        r2kit::PresignedUploadPlan::Multipart(multi) => {
+            assert_eq!(multi.upload_id(), "offline-upload-id-12345");
+            assert_eq!(multi.file_size(), 12 * 1024 * 1024);
+            assert_eq!(multi.part_size(), 8 * 1024 * 1024);
+            assert_eq!(multi.part_count(), 2);
+
+            let debug = format!("{multi:?}");
+            assert!(!debug.contains("offline-upload-id-12345"));
+            assert!(debug.contains("[REDACTED]"));
+        }
+        r2kit::PresignedUploadPlan::Single(_) => panic!("expected multipart plan"),
+    }
+}
+
+#[tokio::test]
+async fn presign_upload_validates_expiry_offline_for_both_branches() {
+    let bucket = offline_bucket();
+
+    // Small file (< threshold) with 0s expiry fails offline before signing
+    let small_res = bucket
+        .presign_upload("small.txt", 1024, Duration::ZERO)
+        .await;
+    assert!(matches!(
+        small_res.unwrap_err(),
+        Error::Validation(ValidationError::PresignExpiryOutOfRange {
+            provided,
+            ..
+        }) if provided == Duration::ZERO
+    ));
+
+    // Large file (>= threshold) with 0s expiry fails offline before any network I/O
+    let large_res = bucket
+        .presign_upload("large.bin", 12 * 1024 * 1024, Duration::ZERO)
+        .await;
+    assert!(matches!(
+        large_res.unwrap_err(),
+        Error::Validation(ValidationError::PresignExpiryOutOfRange {
+            provided,
+            ..
+        }) if provided == Duration::ZERO
+    ));
+}
+
+#[tokio::test]
+async fn presign_upload_scales_part_size_for_very_large_files() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Bucket>contract-tests</Bucket>
+    <Key>huge.tar</Key>
+    <UploadId>huge-upload-id-12345</UploadId>
+</InitiateMultipartUploadResult>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    // 100 GiB file would require > 10,000 parts if 8 MiB part size was used (12,800 parts)
+    let large_size = 100 * 1024 * 1024 * 1024;
+    let res = bucket
+        .presign_upload("huge.tar", large_size, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let _ = server.join();
+
+    match res {
+        r2kit::PresignedUploadPlan::Multipart(plan) => {
+            assert!(plan.part_count() <= 10_000);
+            assert!(plan.part_size() > r2kit::UploadThreshold::DEFAULT_BYTES);
+            assert_eq!(plan.part_count(), 10_000);
+        }
+        r2kit::PresignedUploadPlan::Single(_) => panic!("expected multipart plan for 100 GiB"),
+    }
 }

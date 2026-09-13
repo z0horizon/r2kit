@@ -4,7 +4,7 @@
 
 Please do not open a public issue for a suspected credential leak, presigned URL
 exposure, request-signing flaw, or other vulnerability. Use GitHub's private
-security advisory flow for `zer0horizon/r2kit` instead.
+security advisory flow for `z0horizon/r2kit` instead.
 
 Include the affected version or commit, a minimal reproduction, expected
 impact, and whether any real R2 credential or presigned URL was exposed. Revoke

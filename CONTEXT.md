@@ -23,3 +23,15 @@ _Avoid_: S3Client, Client, StorageClient
 **MultipartSession**:
 An in-progress multipart upload workflow tracking upload ID, parts plan, and completion manifest.
 _Avoid_: MultipartUpload, UploadSession
+
+**TransferManager**:
+An operational engine coordinating object transfers with adaptive strategy selection, concurrency pools, and memory budgeting (in 0.2.1 surfaced via `UploadFileBuilder` and `Bucket::upload_file`).
+_Avoid_: TransferService, UploadQueue, TransferPool
+
+**UploadThreshold**:
+A validated byte limit (at least 5 MiB, defaulting to 8 MiB) governing the boundary between atomic single-part PUT operations and multi-part transfers.
+_Avoid_: ChunkThreshold, CutoffSize, MinMultipartSize
+
+**PresignedUploadPlan**:
+A preflight-validated transfer coordination plan resolving to either a single presigned PUT or a multipart upload session for remote clients.
+_Avoid_: PresignedPlan, UploadScheme

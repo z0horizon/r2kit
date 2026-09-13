@@ -50,6 +50,9 @@ fn async_handles_are_send_and_sync() {
     assert_send_sync::<r2kit::ListMultipartUploadsBuilder>();
     assert_send_sync::<r2kit::MultipartUploadPage>();
     assert_send_sync::<r2kit::MultipartUploadSummary>();
+    assert_send_sync::<r2kit::UploadThreshold>();
+    assert_send_sync::<r2kit::PresignedUploadPlan>();
+    assert_send_sync::<r2kit::PresignedMultipartPlan>();
 }
 
 #[test]
@@ -205,4 +208,78 @@ fn list_multipart_uploads_builder_debug_redacts_upload_id_marker() {
         !debug.contains("sensitive-upload-id-marker-98765"),
         "upload_id_marker was leaked in Debug output: {debug}"
     );
+}
+
+#[test]
+fn into_content_type_converts_str_string_and_mime() {
+    use r2kit::IntoContentType;
+
+    let mime_from_str = "application/json".into_content_type().unwrap();
+    assert_eq!(mime_from_str, mime::APPLICATION_JSON);
+
+    let mime_from_string = String::from("text/plain").into_content_type().unwrap();
+    assert_eq!(mime_from_string, mime::TEXT_PLAIN);
+
+    let mime_from_mime = mime::APPLICATION_OCTET_STREAM.into_content_type().unwrap();
+    assert_eq!(mime_from_mime, mime::APPLICATION_OCTET_STREAM);
+
+    let invalid = "not a valid mime type".into_content_type();
+    assert!(matches!(
+        invalid,
+        Err(Error::InvalidInput {
+            field: "content_type",
+            ..
+        })
+    ));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn multipart_session_snapshot_supports_direct_serde() {
+    let snapshot = MultipartSessionSnapshot::restore(
+        "example-bucket",
+        "videos/example.mp4",
+        "sensitive-upload-id-123",
+        11 * 1024 * 1024,
+        5 * 1024 * 1024,
+    )
+    .unwrap();
+
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(json.contains("example-bucket"));
+    assert!(json.contains("videos/example.mp4"));
+    assert!(json.contains("sensitive-upload-id-123"));
+
+    let restored: MultipartSessionSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.bucket(), snapshot.bucket());
+    assert_eq!(restored.key(), snapshot.key());
+    assert_eq!(restored.expose_upload_id(), snapshot.expose_upload_id());
+    assert_eq!(restored.file_size(), snapshot.file_size());
+    assert_eq!(restored.part_size(), snapshot.part_size());
+
+    // Invalid bucket name fails deserialization at trust boundary
+    let invalid_bucket = json.replace("example-bucket", "INVALID BUCKET");
+    assert!(serde_json::from_str::<MultipartSessionSnapshot>(&invalid_bucket).is_err());
+
+    // Invalid part size (< 5 MiB) fails deserialization
+    let invalid_part = json.replace(&snapshot.part_size().to_string(), "1024");
+    assert!(serde_json::from_str::<MultipartSessionSnapshot>(&invalid_part).is_err());
+
+    // Empty upload ID fails deserialization
+    let empty_upload_id = json.replace("sensitive-upload-id-123", "");
+    assert!(serde_json::from_str::<MultipartSessionSnapshot>(&empty_upload_id).is_err());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn upload_threshold_supports_direct_serde() {
+    let threshold = r2kit::UploadThreshold::default();
+    let json = serde_json::to_string(&threshold).unwrap();
+    assert_eq!(json, (8 * 1024 * 1024).to_string());
+
+    let restored: r2kit::UploadThreshold = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, threshold);
+
+    let invalid: Result<r2kit::UploadThreshold, _> = serde_json::from_str("1024");
+    assert!(invalid.is_err());
 }

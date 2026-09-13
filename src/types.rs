@@ -17,6 +17,8 @@ pub(crate) const MAX_BUCKET_NAME_LEN: usize = 63;
 pub(crate) const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub(crate) const MAX_UPLOAD_SIZE: u64 = 5 * 1024 * 1024 * 1024 - MIN_MULTIPART_PART_SIZE;
 pub(crate) const MAX_MULTIPART_PART_SIZE: u64 = MAX_UPLOAD_SIZE;
+pub(crate) const MAX_MULTIPART_OBJECT_SIZE: u64 =
+    5 * 1024 * 1024 * 1024 * 1024 - 5 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PRESIGN_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 pub(crate) const fn mebibytes(value: u64) -> u64 {
@@ -281,6 +283,70 @@ impl From<BucketName> for String {
     }
 }
 
+/// A validated threshold for selecting single PUT vs multipart upload.
+///
+/// Must be at least [`UploadThreshold::MIN_BYTES`] (5 MiB).
+/// Defaults to [`UploadThreshold::DEFAULT_BYTES`] (8 MiB).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "u64", into = "u64"))]
+pub struct UploadThreshold(u64);
+
+impl UploadThreshold {
+    /// Minimum upload threshold in bytes (5 MiB), matching R2's minimum multipart part size.
+    pub const MIN_BYTES: u64 = 5 * 1024 * 1024;
+    /// Default upload threshold in bytes (8 MiB).
+    pub const DEFAULT_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// Creates and validates a new [`UploadThreshold`].
+    ///
+    /// # Errors
+    /// Returns [`ValidationError::PartSizeOutOfRange`] if `bytes` is less than [`Self::MIN_BYTES`]
+    /// or exceeds the maximum multipart object limit.
+    pub fn new(bytes: u64) -> Result<Self, ValidationError> {
+        if !(Self::MIN_BYTES..=MAX_MULTIPART_OBJECT_SIZE).contains(&bytes) {
+            return Err(ValidationError::PartSizeOutOfRange {
+                provided: bytes,
+                min: Self::MIN_BYTES,
+                max: MAX_MULTIPART_OBJECT_SIZE,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the threshold value in bytes.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for UploadThreshold {
+    fn default() -> Self {
+        Self(Self::DEFAULT_BYTES)
+    }
+}
+
+impl fmt::Display for UploadThreshold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<u64> for UploadThreshold {
+    type Error = ValidationError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<UploadThreshold> for u64 {
+    fn from(threshold: UploadThreshold) -> Self {
+        threshold.get()
+    }
+}
+
 impl From<&BucketName> for String {
     fn from(name: &BucketName) -> Self {
         name.0.clone()
@@ -368,6 +434,51 @@ impl IntoBucketName for &String {
 impl IntoBucketName for Cow<'_, str> {
     fn into_bucket_name(self) -> Result<BucketName, Error> {
         BucketName::new(self.into_owned())
+    }
+}
+
+/// Types that can be converted into a validated MIME media type.
+pub trait IntoContentType {
+    /// Attempts conversion into a validated [`mime::Mime`].
+    fn into_content_type(self) -> Result<mime::Mime, Error>;
+}
+
+impl IntoContentType for mime::Mime {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        Ok(self)
+    }
+}
+
+impl IntoContentType for &mime::Mime {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        Ok(self.clone())
+    }
+}
+
+impl IntoContentType for &str {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.parse::<mime::Mime>().map_err(|_| Error::InvalidInput {
+            field: "content_type",
+            reason: "must be a valid MIME media type",
+        })
+    }
+}
+
+impl IntoContentType for String {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.as_str().into_content_type()
+    }
+}
+
+impl IntoContentType for &String {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.as_str().into_content_type()
+    }
+}
+
+impl IntoContentType for Cow<'_, str> {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.as_ref().into_content_type()
     }
 }
 

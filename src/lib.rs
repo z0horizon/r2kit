@@ -11,7 +11,9 @@ mod object;
 mod observability;
 mod types;
 
-pub use types::{BucketName, IntoBucketName, IntoObjectKey, ObjectKey};
+pub use types::{
+    BucketName, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey, UploadThreshold,
+};
 
 pub use client::{Bucket, BucketInfo, R2Client};
 pub use config::{R2Config, R2ConfigBuilder, R2Jurisdiction};
@@ -19,18 +21,20 @@ pub use error::{ConfigError, Error, ServiceError, ServiceErrorKind, ValidationEr
 pub use headers::CacheControl;
 pub use managed::{
     ManagedMultipartBuilder, ManagedUploadCancellation, ManagedUploadError, ManagedUploadProgress,
-    ManagedUploadResult,
+    ManagedUploadResult, TransferProgress, TransferResult, TransferStrategyUsed, UploadFileBuilder,
 };
 pub use mime::{self, Mime};
 pub use multipart::{
     CompletedObject, CompletionManifest, ListMultipartUploadsBuilder, MultipartPartReceipt,
     MultipartReconciliation, MultipartSessionRecord, MultipartSessionSnapshot, MultipartUploadPage,
     MultipartUploadPartRequest, MultipartUploadSummary, PartMd5, PartNumber, PresignedMultipart,
-    PresignedMultipartBuilder, PresignedRequest, PresignedUploadPart, SecretUrl, UploadedPart,
+    PresignedMultipartBuilder, PresignedMultipartPlan, PresignedRequest, PresignedUploadPart,
+    PresignedUploadPlan, SecretUrl, UploadedPart,
 };
 pub use object::{
     BatchDeleteError, ByteRange, ChecksumAlgorithm, CopyObjectBuilder, CopyObjectResult,
     DeleteObjectFailure, DeleteObjectsResult, DownloadedObject, GetObjectBuilder,
-    HeadObjectBuilder, ListObjectsBuilder, MetadataDirective, ObjectBytes, ObjectMetadata,
-    ObjectPage, ObjectSummary, ObjectUploadOptions, PresignedPutObject, PutObjectResult,
+    HeadObjectBuilder, ListObjectsBuilder, MetadataDirective, ObjectBytes, ObjectItem,
+    ObjectMetadata, ObjectPage, ObjectSummary, ObjectUploadOptions, PresignedPutObject,
+    PutObjectResult,
 };

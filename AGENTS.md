@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-GitHub issues live in `zer0horizon/r2kit` using the `gh` CLI. See `docs/agents/issue-tracker.md`.
+GitHub issues live in `z0horizon/r2kit` using the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
