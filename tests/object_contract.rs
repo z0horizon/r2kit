@@ -167,6 +167,17 @@ fn listing_exposes_a_sendable_page_stream() {
 }
 
 #[test]
+fn listing_exposes_a_sendable_object_stream() {
+    fn assert_send<T: Send>(_: &T) {}
+
+    let stream = offline_bucket().list().prefix("logs/").into_stream();
+    assert_send(&stream);
+
+    let objects_stream = offline_bucket().list().prefix("logs/").into_objects();
+    assert_send(&objects_stream);
+}
+
+#[test]
 fn byte_range_formatting_and_validation() {
     use r2kit::ByteRange;
 

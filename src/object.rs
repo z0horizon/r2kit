@@ -11,7 +11,7 @@ use aws_sdk_s3::{
 };
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 use headers::Header;
 use mime::Mime;
 use oxilangtag::LanguageTag;
@@ -737,6 +737,9 @@ impl PresignedPutObject {
     }
 }
 
+/// Alias for an object summary returned by a bucket listing.
+pub type ObjectItem = ObjectSummary;
+
 /// One object returned by a bucket listing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectSummary {
@@ -880,6 +883,12 @@ impl ObjectPage {
     #[must_use]
     pub fn objects(&self) -> &[ObjectSummary] {
         &self.objects
+    }
+
+    /// Consumes the page and returns its objects.
+    #[must_use]
+    pub fn into_objects(self) -> Vec<ObjectSummary> {
+        self.objects
     }
 
     /// Returns rolled-up prefixes when a delimiter was requested.
@@ -1061,6 +1070,30 @@ impl ListObjectsBuilder {
             let state = next_token.map(|token| next_builder.continuation_token(token));
             Ok(Some((page, state)))
         })
+    }
+
+    /// Streams individual object summaries across all pages until R2 reports that
+    /// the listing is complete.
+    pub fn into_stream(self) -> impl Stream<Item = Result<ObjectItem, Error>> + Send {
+        self.into_pages()
+            .map(|page_res| match page_res {
+                Ok(page) => {
+                    let items: Vec<Result<ObjectItem, Error>> =
+                        page.into_objects().into_iter().map(Ok).collect();
+                    stream::iter(items)
+                }
+                Err(err) => stream::iter(vec![Err(err)]),
+            })
+            .flatten()
+    }
+
+    /// Streams individual object summaries across all pages until R2 reports that
+    /// the listing is complete.
+    ///
+    /// Alias for [`into_stream`](Self::into_stream).
+    #[inline]
+    pub fn into_objects(self) -> impl Stream<Item = Result<ObjectItem, Error>> + Send {
+        self.into_stream()
     }
 }
 
