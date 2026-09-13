@@ -1761,6 +1761,7 @@ impl Bucket {
         expires_in: Duration,
         options: ObjectUploadOptions,
     ) -> Result<PresignedUploadPlan, Error> {
+        types::validate_expiry(expires_in)?;
         let key = key.into_object_key()?;
         let threshold = crate::types::UploadThreshold::default().get();
         if file_size < threshold {

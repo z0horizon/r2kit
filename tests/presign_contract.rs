@@ -515,6 +515,12 @@ fn upload_threshold_validates_offline() {
     let valid = r2kit::UploadThreshold::new(8 * 1024 * 1024).unwrap();
     assert_eq!(valid.get(), 8 * 1024 * 1024);
     assert_eq!(r2kit::UploadThreshold::default().get(), 8 * 1024 * 1024);
+
+    let too_large = r2kit::UploadThreshold::new(u64::MAX);
+    assert!(matches!(
+        too_large,
+        Err(ValidationError::PartSizeOutOfRange { .. })
+    ));
 }
 
 #[tokio::test]
@@ -624,4 +630,33 @@ async fn presign_upload_returns_multipart_for_above_threshold() {
         }
         r2kit::PresignedUploadPlan::Single(_) => panic!("expected multipart plan"),
     }
+}
+
+#[tokio::test]
+async fn presign_upload_validates_expiry_offline_for_both_branches() {
+    let bucket = offline_bucket();
+
+    // Small file (< threshold) with 0s expiry fails offline before signing
+    let small_res = bucket
+        .presign_upload("small.txt", 1024, Duration::ZERO)
+        .await;
+    assert!(matches!(
+        small_res.unwrap_err(),
+        Error::Validation(ValidationError::PresignExpiryOutOfRange {
+            provided,
+            ..
+        }) if provided == Duration::ZERO
+    ));
+
+    // Large file (>= threshold) with 0s expiry fails offline before any network I/O
+    let large_res = bucket
+        .presign_upload("large.bin", 12 * 1024 * 1024, Duration::ZERO)
+        .await;
+    assert!(matches!(
+        large_res.unwrap_err(),
+        Error::Validation(ValidationError::PresignExpiryOutOfRange {
+            provided,
+            ..
+        }) if provided == Duration::ZERO
+    ));
 }

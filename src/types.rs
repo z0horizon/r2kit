@@ -301,9 +301,10 @@ impl UploadThreshold {
     /// Creates and validates a new [`UploadThreshold`].
     ///
     /// # Errors
-    /// Returns [`ValidationError::PartSizeOutOfRange`] if `bytes` is less than [`Self::MIN_BYTES`].
+    /// Returns [`ValidationError::PartSizeOutOfRange`] if `bytes` is less than [`Self::MIN_BYTES`]
+    /// or exceeds the maximum multipart object limit.
     pub fn new(bytes: u64) -> Result<Self, ValidationError> {
-        if bytes < Self::MIN_BYTES {
+        if !(Self::MIN_BYTES..=MAX_MULTIPART_OBJECT_SIZE).contains(&bytes) {
             return Err(ValidationError::PartSizeOutOfRange {
                 provided: bytes,
                 min: Self::MIN_BYTES,
