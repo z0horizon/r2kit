@@ -1217,6 +1217,10 @@ impl UploadFileBuilder {
     }
 
     /// Registers a progress callback invoked after transfer progress changes.
+    ///
+    /// For multipart transfers (files meeting or exceeding [`threshold`](Self::threshold)),
+    /// progress is reported incrementally after each part uploads. For atomic single-part PUT
+    /// transfers (sub-threshold or 0-byte files), progress is reported once at 100% upon completion.
     #[must_use]
     pub fn on_progress(
         mut self,

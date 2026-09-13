@@ -11,7 +11,7 @@ use aws_sdk_s3::{
 };
 use aws_smithy_types::date_time::Format as DateTimeFormat;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::{Stream, StreamExt, stream};
+use futures_util::{Stream, StreamExt, future::Either, stream};
 use headers::Header;
 use mime::Mime;
 use oxilangtag::LanguageTag;
@@ -1096,12 +1096,8 @@ impl ListObjectsBuilder {
     pub fn into_stream(self) -> impl Stream<Item = Result<ObjectItem, Error>> + Send {
         self.into_pages()
             .map(|page_res| match page_res {
-                Ok(page) => {
-                    let items: Vec<Result<ObjectItem, Error>> =
-                        page.into_objects().into_iter().map(Ok).collect();
-                    stream::iter(items)
-                }
-                Err(err) => stream::iter(vec![Err(err)]),
+                Ok(page) => Either::Left(stream::iter(page.into_objects().into_iter().map(Ok))),
+                Err(err) => Either::Right(stream::iter(std::iter::once(Err(err)))),
             })
             .flatten()
     }
