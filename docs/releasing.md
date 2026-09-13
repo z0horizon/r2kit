@@ -36,9 +36,8 @@ cargo publish --locked
 git push origin v0.1.0
 ```
 
-Create a GitHub release titled `r2kit <version> — Safe Cloudflare R2 transfers
-for Rust` from that tag. Lead with the installation command and release value
-proposition, then copy the matching changelog section into its notes. Confirm
+Create a GitHub release titled `v<version>` (e.g. `v0.2.1`) from that tag. Lead with
+the installation command, then copy the matching changelog section into its notes. Confirm
 the version is visible on crates.io and its docs build is available on docs.rs;
 only then set the repository homepage to the live docs.rs URL.
 

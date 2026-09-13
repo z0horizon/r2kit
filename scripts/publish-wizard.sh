@@ -227,7 +227,7 @@ pause
 stage "Create GitHub Release"
 say "Creating GitHub Release with notes extracted from CHANGELOG.md."
 
-RELEASE_TITLE="r2kit 0.2.1 — Safe Cloudflare R2 transfers for Rust"
+RELEASE_TITLE="v0.2.1"
 
 RELEASE_NOTES=$(cat <<'EOF'
 ### Installation
