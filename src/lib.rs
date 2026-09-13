@@ -11,7 +11,7 @@ mod object;
 mod observability;
 mod types;
 
-pub use types::{BucketName, IntoBucketName, IntoObjectKey, ObjectKey};
+pub use types::{BucketName, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey};
 
 pub use client::{Bucket, BucketInfo, R2Client};
 pub use config::{R2Config, R2ConfigBuilder, R2Jurisdiction};

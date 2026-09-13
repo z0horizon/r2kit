@@ -18,8 +18,8 @@ use oxilangtag::LanguageTag;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
 use crate::{
-    Bucket, BucketName, Error, IntoBucketName, IntoObjectKey, ObjectKey, PresignedRequest,
-    ValidationError, types,
+    Bucket, BucketName, Error, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey,
+    PresignedRequest, ValidationError, types,
 };
 
 macro_rules! map_object_error {
@@ -141,7 +141,7 @@ pub(crate) fn compute_checksum(bytes: &[u8], algorithm: ChecksumAlgorithm) -> St
 /// not on individual part requests.
 #[derive(Clone, Debug, Default)]
 pub struct ObjectUploadOptions {
-    content_type: Option<Mime>,
+    content_type: Option<Result<Mime, Error>>,
     cache_control: Option<headers::CacheControl>,
     content_disposition: Option<String>,
     content_encoding: Option<String>,
@@ -163,8 +163,11 @@ impl ObjectUploadOptions {
 
     /// Returns the configured media type.
     #[must_use]
-    pub const fn content_type(&self) -> Option<&Mime> {
-        self.content_type.as_ref()
+    pub fn content_type(&self) -> Option<&Mime> {
+        match &self.content_type {
+            Some(Ok(mime)) => Some(mime),
+            _ => None,
+        }
     }
 
     /// Returns the configured cache policy.
@@ -247,8 +250,8 @@ impl ObjectUploadOptions {
 
     /// Returns a copy configured with this MIME media type.
     #[must_use]
-    pub fn with_content_type(mut self, value: Mime) -> Self {
-        self.content_type = Some(value);
+    pub fn with_content_type(mut self, value: impl IntoContentType) -> Self {
+        self.content_type = Some(value.into_content_type());
         self
     }
 
@@ -334,7 +337,7 @@ impl ObjectUploadOptions {
     }
 
     pub(crate) fn apply_to<T: SetObjectMetadata>(&self, req: T) -> T {
-        req.set_content_type(self.content_type.as_ref().map(ToString::to_string))
+        req.set_content_type(self.content_type().map(ToString::to_string))
             .set_cache_control(self.cache_control.as_ref().map(encode_header))
             .set_content_disposition(self.content_disposition.clone())
             .set_content_encoding(self.content_encoding.clone())
@@ -360,6 +363,9 @@ impl ObjectUploadOptions {
     }
 
     pub(crate) fn validate(&self) -> Result<(), Error> {
+        if let Some(res) = &self.content_type {
+            res.as_ref().map_err(Clone::clone)?;
+        }
         for (field, value) in [
             ("content_disposition", self.content_disposition.as_deref()),
             ("content_encoding", self.content_encoding.as_deref()),
@@ -391,8 +397,7 @@ impl ObjectUploadOptions {
         }
 
         let mut total_bytes = self
-            .content_type
-            .as_ref()
+            .content_type()
             .map_or(0, |value| "content-type".len() + value.to_string().len())
             + self.cache_control.as_ref().map_or(0, |value| {
                 "cache-control".len() + encode_header(value).len()
@@ -734,6 +739,18 @@ impl PresignedPutObject {
     #[must_use]
     pub fn into_request(self) -> PresignedRequest {
         self.request
+    }
+
+    /// Returns the signed URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.request.as_str()
+    }
+
+    /// Consumes this value and returns the signed URL as an owned string.
+    #[must_use]
+    pub fn into_url_string(self) -> String {
+        self.request.into_url_string()
     }
 }
 

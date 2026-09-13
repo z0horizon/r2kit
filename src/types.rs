@@ -371,6 +371,51 @@ impl IntoBucketName for Cow<'_, str> {
     }
 }
 
+/// Types that can be converted into a validated MIME media type.
+pub trait IntoContentType {
+    /// Attempts conversion into a validated [`mime::Mime`].
+    fn into_content_type(self) -> Result<mime::Mime, Error>;
+}
+
+impl IntoContentType for mime::Mime {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        Ok(self)
+    }
+}
+
+impl IntoContentType for &mime::Mime {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        Ok(self.clone())
+    }
+}
+
+impl IntoContentType for &str {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.parse::<mime::Mime>().map_err(|_| Error::InvalidInput {
+            field: "content_type",
+            reason: "must be a valid MIME media type",
+        })
+    }
+}
+
+impl IntoContentType for String {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.as_str().into_content_type()
+    }
+}
+
+impl IntoContentType for &String {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.as_str().into_content_type()
+    }
+}
+
+impl IntoContentType for Cow<'_, str> {
+    fn into_content_type(self) -> Result<mime::Mime, Error> {
+        self.as_ref().into_content_type()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

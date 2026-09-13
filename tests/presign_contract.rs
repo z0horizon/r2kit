@@ -370,3 +370,132 @@ async fn presigned_multipart_rejects_checksum_and_conditional_headers() {
         }
     ));
 }
+
+#[tokio::test]
+async fn presigned_requests_support_into_content_type_variants() {
+    let bucket = offline_bucket();
+
+    // 1. &str
+    let opts_str = ObjectUploadOptions::new().with_content_type("application/json");
+    let put_str = bucket
+        .presign_put_with_options("test.json", 100, Duration::from_secs(900), opts_str)
+        .await
+        .unwrap();
+    let headers: Vec<_> = put_str.request().required_headers().collect();
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && *v == "application/json")
+    );
+
+    // 2. String
+    let opts_string = ObjectUploadOptions::new().with_content_type(String::from("text/plain"));
+    let put_string = bucket
+        .presign_put_with_options("test.txt", 100, Duration::from_secs(900), opts_string)
+        .await
+        .unwrap();
+    let headers: Vec<_> = put_string.request().required_headers().collect();
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && *v == "text/plain")
+    );
+
+    // 3. mime::Mime
+    let opts_mime = ObjectUploadOptions::new().with_content_type(mime::APPLICATION_OCTET_STREAM);
+    let put_mime = bucket
+        .presign_put_with_options("test.bin", 100, Duration::from_secs(900), opts_mime)
+        .await
+        .unwrap();
+    let headers: Vec<_> = put_mime.request().required_headers().collect();
+    assert!(
+        headers.iter().any(
+            |(k, v)| k.eq_ignore_ascii_case("content-type") && *v == "application/octet-stream"
+        )
+    );
+
+    // PresignedMultipartBuilder.content_type variants
+    let _b1 = bucket
+        .presigned_multipart("test.json")
+        .unwrap()
+        .content_type("application/json");
+    let _b2 = bucket
+        .presigned_multipart("test.txt")
+        .unwrap()
+        .content_type(String::from("text/plain"));
+    let _b3 = bucket
+        .presigned_multipart("test.bin")
+        .unwrap()
+        .content_type(mime::APPLICATION_OCTET_STREAM);
+}
+
+#[tokio::test]
+async fn into_content_type_rejects_invalid_mime_offline() {
+    let bucket = offline_bucket();
+    let opts_invalid = ObjectUploadOptions::new().with_content_type("not a valid mime type");
+    let result = bucket
+        .presign_put_with_options("test.bin", 100, Duration::from_secs(900), opts_invalid)
+        .await;
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::InvalidInput {
+            field: "content_type",
+            ..
+        }
+    ));
+
+    let result_mp = bucket
+        .presigned_multipart("test.bin")
+        .unwrap()
+        .file_size(10 * 1024 * 1024)
+        .part_size_mib(5)
+        .content_type("invalid mime type")
+        .create()
+        .await;
+    assert!(matches!(
+        result_mp.unwrap_err(),
+        Error::InvalidInput {
+            field: "content_type",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn presigned_url_accessors_expose_url_while_redacting_debug() {
+    let bucket = offline_bucket();
+    let put = bucket
+        .presign_put("photos/vacation.jpg", 1024, Duration::from_secs(900))
+        .await
+        .unwrap();
+
+    // Test PresignedPutObject accessors
+    let url_slice: &str = put.as_str();
+    assert!(url_slice.starts_with("https://"));
+    assert!(url_slice.contains("X-Amz-Signature="));
+    assert!(url_slice.contains("photos/vacation.jpg"));
+
+    // Debug on PresignedPutObject should redact the URL
+    let put_debug = format!("{put:?}");
+    assert!(!put_debug.contains("X-Amz-Signature="));
+    assert!(put_debug.contains("[REDACTED PRESIGNED URL]"));
+
+    // PresignedRequest accessors
+    let req = put.request();
+    let req_url_slice: &str = req.as_str();
+    assert_eq!(req_url_slice, url_slice);
+
+    let req_debug = format!("{req:?}");
+    assert!(!req_debug.contains("X-Amz-Signature="));
+    assert!(req_debug.contains("[REDACTED PRESIGNED URL]"));
+
+    // Test into_url_string on PresignedRequest
+    let req_cloned = req.clone();
+    let req_url_str: String = req_cloned.into_url_string();
+    assert_eq!(req_url_str, url_slice);
+
+    // Test into_url_string on PresignedPutObject
+    let expected_url = url_slice.to_string();
+    let put_url_str: String = put.into_url_string();
+    assert_eq!(put_url_str, expected_url);
+}

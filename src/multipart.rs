@@ -13,7 +13,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{Stream, stream};
 
 use crate::{
-    Bucket, Error, IntoBucketName, IntoObjectKey, ObjectUploadOptions, ValidationError, types,
+    Bucket, Error, IntoBucketName, IntoContentType, IntoObjectKey, ObjectUploadOptions,
+    ValidationError, types,
 };
 
 // https://developers.cloudflare.com/r2/platform/limits/
@@ -294,6 +295,18 @@ impl PresignedRequest {
             self.required_headers,
         )
     }
+
+    /// Returns the signed URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.url.expose()
+    }
+
+    /// Consumes this value and returns the signed URL as an owned string.
+    #[must_use]
+    pub fn into_url_string(self) -> String {
+        self.url.into_exposed_string()
+    }
 }
 
 impl fmt::Debug for PresignedRequest {
@@ -460,7 +473,8 @@ impl fmt::Debug for MultipartUploadPartRequest {
 }
 
 /// Persistable state needed to resume a presigned multipart upload.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MultipartSessionSnapshot {
     bucket: String,
     key: String,
@@ -746,7 +760,7 @@ impl PresignedMultipartBuilder {
 
     /// Sets the completed object's MIME media type.
     #[must_use]
-    pub fn content_type(mut self, value: mime::Mime) -> Self {
+    pub fn content_type(mut self, value: impl IntoContentType) -> Self {
         self.options = self.options.with_content_type(value);
         self
     }
