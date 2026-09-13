@@ -165,7 +165,7 @@ impl ObjectUploadOptions {
 
     /// Returns the configured media type.
     #[must_use]
-    pub fn content_type(&self) -> Option<&Mime> {
+    pub const fn content_type(&self) -> Option<&Mime> {
         match &self.content_type {
             Some(Ok(mime)) => Some(mime),
             _ => None,
