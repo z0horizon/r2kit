@@ -484,7 +484,7 @@ Enable Serde when a session or protocol DTO crosses a storage or JSON boundary:
 
 ```toml
 [dependencies]
-r2kit = { version = "0.2.0", features = ["serde"] }
+r2kit = { version = "0.2.1", features = ["serde"] }
 ```
 
 `MultipartSessionSnapshot::into_persistence_record()` deliberately exposes a
@@ -527,7 +527,7 @@ Tracing is opt-in and disabled by default:
 
 ```toml
 [dependencies]
-r2kit = { version = "0.2.0", features = ["tracing"] }
+r2kit = { version = "0.2.1", features = ["tracing"] }
 ```
 
 The library emits events to target `r2kit` but never installs a subscriber.

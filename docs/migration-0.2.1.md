@@ -1,6 +1,6 @@
-# Migrating from 0.2.x to 0.3.0
+# Migrating to 0.2.1 (Unified Transfer Manager)
 
-`r2kit 0.3.0` introduces the Unified Transfer Manager, adaptive upload dispatch,
+`r2kit 0.2.1` introduces the Unified Transfer Manager, adaptive upload dispatch,
 coordinated presigned uploads, direct multipart abort, canonical not-found detection,
 and streamlined object listing streams.
 
@@ -11,7 +11,7 @@ complex snapshot reconstructions, and manual size-based branching.
 
 ## Key Highlights
 
-| Feature | In 0.2.x | In 0.3.0 |
+| Feature | In 0.2.0 | In 0.2.1 |
 |---|---|---|
 | **Adaptive file upload** | Manual branching between `put_bytes`/`put_stream` and `managed_multipart` | Single facade: `bucket.upload_file("key", "path").await` |
 | **0-byte file uploads** | `managed_multipart` errored with `MultipartFileSizeZero` | `upload_file` automatically dispatches single PUT with 100% progress |

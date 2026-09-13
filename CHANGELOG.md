@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-13
+
+### Added
+
+- Adaptive file upload via `Bucket::upload_file(key, path)` automatically selecting atomic single PUT for 0-byte and sub-threshold files, and pipelined multipart for files meeting or exceeding the threshold.
+- Configurable `UploadThreshold` (validated `>= 5 MiB`, defaulting to 8 MiB) governing adaptive upload and presigned upload plan dispatch.
+- Coordinated presigned upload planning via `Bucket::presign_upload` and `Bucket::presign_upload_with_options` returning typed `PresignedUploadPlan` (`Single` vs `Multipart`), with preflight offline expiry validation.
+- Direct multipart aborting via `Bucket::abort_multipart_upload(key, upload_id)` without requiring prior snapshot restoration or file dimensions.
+- Canonical `Error::is_not_found()` helper and unified remote HTTP 404 error mapping to `Error::NotFound`.
+- Zero-allocation async object pagination streams via `ListObjectsBuilder::into_stream()` and `into_objects()`, re-exporting `ObjectItem`.
+- `IntoContentType` trait supporting `&str`, `String`, and `mime::Mime` with offline media-type validation.
+- URL string accessors (`.as_str()` and `.into_url_string()`) on `PresignedRequest` and `PresignedPutObject` while preserving secret signature redaction in `Debug`.
+- Direct `Serialize` and `Deserialize` derives on `MultipartSessionSnapshot` and `UploadThreshold` under the `serde` feature flag.
+
+### Fixed
+
+- Fixed 0-byte file upload failures caused by S3/R2 multipart uploads rejecting zero-part completions (`ValidationError::MultipartFileSizeZero`).
+- Fixed remote HTTP 404 responses unexpectedly surfacing as generic service errors instead of canonical not-found representations.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added
