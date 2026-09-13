@@ -796,3 +796,242 @@ async fn list_multipart_uploads_rejects_truncated_response_without_markers() {
         }
     ));
 }
+
+#[tokio::test]
+async fn abort_multipart_upload_validates_inputs_before_network() {
+    let bucket = offline_bucket();
+
+    let empty_key = bucket
+        .abort_multipart_upload("", "upload-123")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        empty_key,
+        Error::InvalidInput { field: "key", .. }
+    ));
+
+    let empty_upload = bucket
+        .abort_multipart_upload("valid-key", "")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        empty_upload,
+        Error::InvalidInput {
+            field: "upload_id",
+            reason: "must not be empty",
+        }
+    ));
+
+    let whitespace_upload = bucket
+        .abort_multipart_upload("valid-key", "   \t\n")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        whitespace_upload,
+        Error::InvalidInput {
+            field: "upload_id",
+            reason: "must not be empty",
+        }
+    ));
+}
+
+#[tokio::test]
+async fn abort_multipart_upload_dispatches_request() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("DELETE "),
+                "expected DELETE request, got: {req}"
+            );
+            assert!(
+                req.contains("uploadId=test-upload-id"),
+                "expected uploadId query parameter in request"
+            );
+
+            let response = "HTTP/1.1 204 No Content\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    let result = bucket
+        .abort_multipart_upload("test-key", "test-upload-id")
+        .await;
+    let _ = server.join();
+
+    assert!(result.is_ok(), "expected Ok(()), got: {result:?}");
+}
+
+#[tokio::test]
+async fn is_not_found_helper_behavior() {
+    assert!(Error::NotFound.is_not_found());
+
+    assert!(!Error::PreconditionFailed.is_not_found());
+    assert!(!Error::NotModified.is_not_found());
+    assert!(!Error::Cancelled.is_not_found());
+    assert!(!Error::Presign.is_not_found());
+    assert!(!Error::InvalidSignedHeader.is_not_found());
+    assert!(
+        !Error::InvalidInput {
+            field: "key",
+            reason: "must not be empty",
+        }
+        .is_not_found()
+    );
+
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    // Verify Error::Remote with 404 yields is_not_found() == true
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    let err = bucket.list_multipart_uploads().send().await.unwrap_err();
+    let _ = server.join();
+
+    assert!(err.is_not_found());
+    if let Error::Remote(se) = &err {
+        assert_eq!(se.kind(), r2kit::ServiceErrorKind::NotFound);
+    } else {
+        panic!("expected Error::Remote, got {err:?}");
+    }
+
+    // Verify Error::Remote with 403 yields is_not_found() == false
+    let listener_403 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_403 = listener_403.local_addr().unwrap().port();
+
+    let server_403 = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener_403.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config_403 = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port_403}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client_403 = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config_403));
+    let bucket_403 = client_403.bucket("contract-tests").unwrap();
+
+    let err_403 = bucket_403
+        .list_multipart_uploads()
+        .send()
+        .await
+        .unwrap_err();
+    let _ = server_403.join();
+
+    assert!(!err_403.is_not_found());
+    if let Error::Remote(se) = &err_403 {
+        assert_eq!(se.kind(), r2kit::ServiceErrorKind::PermissionDenied);
+    } else {
+        panic!("expected Error::Remote, got {err_403:?}");
+    }
+}
+
+#[tokio::test]
+async fn remote_404_maps_canonically_to_not_found() {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    let err = bucket
+        .abort_multipart_upload("missing-key", "upload-id-404")
+        .await
+        .unwrap_err();
+    let _ = server.join();
+
+    assert_eq!(err, Error::NotFound);
+    assert!(err.is_not_found());
+}

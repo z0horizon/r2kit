@@ -416,6 +416,17 @@ impl std::error::Error for Error {
 }
 
 impl Error {
+    /// Returns `true` if this error represents a missing remote resource (such as HTTP 404
+    /// or `NoSuchKey`/`NoSuchUpload`).
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::NotFound => true,
+            Self::Remote(se) => se.kind() == ServiceErrorKind::NotFound,
+            _ => false,
+        }
+    }
+
     pub(crate) fn remote<E: ProvideErrorMetadata>(
         operation: &'static str,
         error: &SdkError<E>,
@@ -423,6 +434,20 @@ impl Error {
         let error = ServiceError::from_sdk(operation, error);
         crate::observability::remote_failure(&error);
         Self::Remote(error)
+    }
+
+    pub(crate) fn from_sdk<E: ProvideErrorMetadata>(
+        operation: &'static str,
+        error: &SdkError<E>,
+    ) -> Self {
+        if error
+            .raw_response()
+            .is_some_and(|response| response.status().as_u16() == 404)
+        {
+            Self::NotFound
+        } else {
+            Self::remote(operation, error)
+        }
     }
 }
 
@@ -485,5 +510,25 @@ mod tests {
         assert_eq!(error.status(), None);
         assert!(!format!("{error}").contains("sensitive-source"));
         assert!(!format!("{error:?}").contains("sensitive-source"));
+    }
+
+    #[test]
+    fn is_not_found_identifies_not_found_variants() {
+        assert!(Error::NotFound.is_not_found());
+
+        let service_err = ServiceError {
+            operation: "GetObject",
+            kind: ServiceErrorKind::NotFound,
+            status: Some(404),
+        };
+        assert!(Error::Remote(service_err).is_not_found());
+
+        let auth_err = ServiceError {
+            operation: "GetObject",
+            kind: ServiceErrorKind::Authentication,
+            status: Some(401),
+        };
+        assert!(!Error::Remote(auth_err).is_not_found());
+        assert!(!Error::PreconditionFailed.is_not_found());
     }
 }

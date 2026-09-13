@@ -1878,6 +1878,42 @@ impl Bucket {
         Ok(())
     }
 
+    /// Aborts an in-progress or orphaned multipart upload directly.
+    ///
+    /// This method calls S3/R2 `AbortMultipartUpload` without requiring a
+    /// [`MultipartSessionSnapshot`](crate::MultipartSessionSnapshot) or prior
+    /// knowledge of part sizing or file dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] if `key` or `upload_id` is empty.
+    /// Returns [`Error::NotFound`] if the specified upload or object does not exist.
+    /// Returns [`Error::Remote`] on other Cloudflare R2 service failures.
+    pub async fn abort_multipart_upload(
+        &self,
+        key: impl IntoObjectKey,
+        upload_id: impl Into<String>,
+    ) -> Result<(), Error> {
+        let key = key.into_object_key()?;
+        let upload_id = upload_id.into();
+        if upload_id.trim().is_empty() {
+            return Err(Error::InvalidInput {
+                field: "upload_id",
+                reason: "must not be empty",
+            });
+        }
+        self.client
+            .as_sdk()
+            .abort_multipart_upload()
+            .bucket(self.name())
+            .key(key.as_str())
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|err| Error::from_sdk("AbortMultipartUpload", &err))?;
+        Ok(())
+    }
+
     /// Copies an object within this bucket without downloading its body.
     ///
     /// R2 performs the copy server-side and preserves the source metadata. Both
