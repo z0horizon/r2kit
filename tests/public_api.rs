@@ -50,6 +50,9 @@ fn async_handles_are_send_and_sync() {
     assert_send_sync::<r2kit::ListMultipartUploadsBuilder>();
     assert_send_sync::<r2kit::MultipartUploadPage>();
     assert_send_sync::<r2kit::MultipartUploadSummary>();
+    assert_send_sync::<r2kit::UploadThreshold>();
+    assert_send_sync::<r2kit::PresignedUploadPlan>();
+    assert_send_sync::<r2kit::PresignedMultipartPlan>();
 }
 
 #[test]
@@ -253,4 +256,18 @@ fn multipart_session_snapshot_supports_direct_serde() {
     assert_eq!(restored.expose_upload_id(), snapshot.expose_upload_id());
     assert_eq!(restored.file_size(), snapshot.file_size());
     assert_eq!(restored.part_size(), snapshot.part_size());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn upload_threshold_supports_direct_serde() {
+    let threshold = r2kit::UploadThreshold::default();
+    let json = serde_json::to_string(&threshold).unwrap();
+    assert_eq!(json, (8 * 1024 * 1024).to_string());
+
+    let restored: r2kit::UploadThreshold = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, threshold);
+
+    let invalid: Result<r2kit::UploadThreshold, _> = serde_json::from_str("1024");
+    assert!(invalid.is_err());
 }

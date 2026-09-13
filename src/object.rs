@@ -19,7 +19,9 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
 use crate::{
     Bucket, BucketName, Error, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey,
-    PresignedRequest, ValidationError, types,
+    PresignedRequest, ValidationError,
+    multipart::{PresignedMultipartPlan, PresignedUploadPlan},
+    types,
 };
 
 macro_rules! map_object_error {
@@ -1730,6 +1732,54 @@ impl Bucket {
             content_length,
             request: PresignedRequest::from_sdk(signed, expires_in)?,
         })
+    }
+
+    /// Creates a coordinated presigned upload plan for an object of known size.
+    ///
+    /// Automatically selects between a single presigned PUT and a presigned multipart
+    /// upload session based on the default threshold ([`crate::UploadThreshold::DEFAULT_BYTES`]).
+    pub async fn presign_upload(
+        &self,
+        key: impl IntoObjectKey,
+        file_size: u64,
+        expires_in: Duration,
+    ) -> Result<PresignedUploadPlan, Error> {
+        self.presign_upload_with_options(key, file_size, expires_in, ObjectUploadOptions::default())
+            .await
+    }
+
+    /// Creates a coordinated presigned upload plan with custom upload options.
+    ///
+    /// If `file_size` is smaller than the upload threshold (or 0 bytes),
+    /// generates a single presigned PUT request ([`PresignedUploadPlan::Single`]).
+    /// If `file_size` meets or exceeds the threshold, initiates a presigned multipart upload
+    /// ([`PresignedUploadPlan::Multipart`]).
+    pub async fn presign_upload_with_options(
+        &self,
+        key: impl IntoObjectKey,
+        file_size: u64,
+        expires_in: Duration,
+        options: ObjectUploadOptions,
+    ) -> Result<PresignedUploadPlan, Error> {
+        let key = key.into_object_key()?;
+        let threshold = crate::types::UploadThreshold::default().get();
+        if file_size < threshold {
+            let put = self
+                .presign_put_with_options(&key, file_size, expires_in, options)
+                .await?;
+            Ok(PresignedUploadPlan::Single(put))
+        } else {
+            let session = self
+                .presigned_multipart(&key)?
+                .file_size(file_size)
+                .part_size(crate::types::UploadThreshold::DEFAULT_BYTES)
+                .upload_options(options)
+                .create()
+                .await?;
+            Ok(PresignedUploadPlan::Multipart(
+                PresignedMultipartPlan::from_session(session),
+            ))
+        }
     }
 
     /// Uploads an in-memory object with a single R2 request.

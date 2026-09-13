@@ -499,3 +499,129 @@ async fn presigned_url_accessors_expose_url_while_redacting_debug() {
     let put_url_str: String = put.into_url_string();
     assert_eq!(put_url_str, expected_url);
 }
+
+#[test]
+fn upload_threshold_validates_offline() {
+    let result = r2kit::UploadThreshold::new(4 * 1024 * 1024);
+    assert!(matches!(
+        result,
+        Err(ValidationError::PartSizeOutOfRange {
+            provided: 4_194_304,
+            min: 5_242_880,
+            ..
+        })
+    ));
+
+    let valid = r2kit::UploadThreshold::new(8 * 1024 * 1024).unwrap();
+    assert_eq!(valid.get(), 8 * 1024 * 1024);
+    assert_eq!(r2kit::UploadThreshold::default().get(), 8 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn presign_upload_returns_single_for_sub_threshold() {
+    let bucket = offline_bucket();
+    let plan = bucket
+        .presign_upload("small.txt", 2 * 1024 * 1024, Duration::from_secs(900))
+        .await
+        .unwrap();
+
+    assert!(!plan.is_multipart());
+    match plan {
+        r2kit::PresignedUploadPlan::Single(put) => {
+            assert_eq!(put.content_length(), 2 * 1024 * 1024);
+            assert!(put.as_str().contains("small.txt"));
+        }
+        r2kit::PresignedUploadPlan::Multipart(_) => panic!("expected single PUT plan"),
+    }
+}
+
+#[tokio::test]
+async fn presign_upload_handles_zero_byte_as_single() {
+    let bucket = offline_bucket();
+    let plan = bucket
+        .presign_upload("empty.txt", 0, Duration::from_secs(900))
+        .await
+        .unwrap();
+
+    assert!(!plan.is_multipart());
+    match plan {
+        r2kit::PresignedUploadPlan::Single(put) => {
+            assert_eq!(put.content_length(), 0);
+            assert!(put.as_str().contains("empty.txt"));
+        }
+        r2kit::PresignedUploadPlan::Multipart(_) => panic!("expected single PUT plan"),
+    }
+}
+
+#[tokio::test]
+async fn presign_upload_returns_multipart_for_above_threshold() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("POST "),
+                "expected POST request, got: {req}"
+            );
+            assert!(req.contains("uploads"), "expected ?uploads query parameter");
+
+            let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Bucket>contract-tests</Bucket>
+    <Key>large.bin</Key>
+    <UploadId>offline-upload-id-12345</UploadId>
+</InitiateMultipartUploadResult>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let sdk_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("auto"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .force_path_style(true)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "dummy-access",
+            "dummy-secret",
+            None,
+            None,
+            "contract-test",
+        ))
+        .build();
+    let client = R2Client::from_sdk(aws_sdk_s3::Client::from_conf(sdk_config));
+    let bucket = client.bucket("contract-tests").unwrap();
+
+    let plan = bucket
+        .presign_upload("large.bin", 12 * 1024 * 1024, Duration::from_secs(900))
+        .await
+        .unwrap();
+    let _ = server.join();
+
+    assert!(plan.is_multipart());
+    match plan {
+        r2kit::PresignedUploadPlan::Multipart(multi) => {
+            assert_eq!(multi.upload_id(), "offline-upload-id-12345");
+            assert_eq!(multi.file_size(), 12 * 1024 * 1024);
+            assert_eq!(multi.part_size(), 8 * 1024 * 1024);
+            assert_eq!(multi.part_count(), 2);
+
+            let debug = format!("{multi:?}");
+            assert!(!debug.contains("offline-upload-id-12345"));
+            assert!(debug.contains("[REDACTED]"));
+        }
+        r2kit::PresignedUploadPlan::Single(_) => panic!("expected multipart plan"),
+    }
+}

@@ -11,7 +11,9 @@ mod object;
 mod observability;
 mod types;
 
-pub use types::{BucketName, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey};
+pub use types::{
+    BucketName, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey, UploadThreshold,
+};
 
 pub use client::{Bucket, BucketInfo, R2Client};
 pub use config::{R2Config, R2ConfigBuilder, R2Jurisdiction};
@@ -26,7 +28,8 @@ pub use multipart::{
     CompletedObject, CompletionManifest, ListMultipartUploadsBuilder, MultipartPartReceipt,
     MultipartReconciliation, MultipartSessionRecord, MultipartSessionSnapshot, MultipartUploadPage,
     MultipartUploadPartRequest, MultipartUploadSummary, PartMd5, PartNumber, PresignedMultipart,
-    PresignedMultipartBuilder, PresignedRequest, PresignedUploadPart, SecretUrl, UploadedPart,
+    PresignedMultipartBuilder, PresignedMultipartPlan, PresignedRequest, PresignedUploadPart,
+    PresignedUploadPlan, SecretUrl, UploadedPart,
 };
 pub use object::{
     BatchDeleteError, ByteRange, ChecksumAlgorithm, CopyObjectBuilder, CopyObjectResult,
