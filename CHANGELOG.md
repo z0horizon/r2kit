@@ -94,6 +94,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Enforced R2's documented 63-character bucket-name maximum.
 - Enforced R2's effective per-request upload maximum of 5 MiB below 5 GiB.
 
-[Unreleased]: https://github.com/zer0horizon/r2kit/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/zer0horizon/r2kit/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/zer0horizon/r2kit/releases/tag/v0.1.0
+[Unreleased]: https://github.com/z0horizon/r2kit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/z0horizon/r2kit/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/z0horizon/r2kit/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/z0horizon/r2kit/releases/tag/v0.1.0

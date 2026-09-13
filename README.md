@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/r2kit.svg)](https://crates.io/crates/r2kit)
 [![Documentation](https://docs.rs/r2kit/badge.svg)](https://docs.rs/r2kit)
-[![CI](https://github.com/zer0horizon/r2kit/actions/workflows/ci.yml/badge.svg)](https://github.com/zer0horizon/r2kit/actions/workflows/ci.yml)
+[![CI](https://github.com/z0horizon/r2kit/actions/workflows/ci.yml/badge.svg)](https://github.com/z0horizon/r2kit/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 Ergonomic, safety-first Cloudflare R2 transfers for Rust.
