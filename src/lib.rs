@@ -31,6 +31,7 @@ pub use multipart::{
 pub use object::{
     BatchDeleteError, ByteRange, ChecksumAlgorithm, CopyObjectBuilder, CopyObjectResult,
     DeleteObjectFailure, DeleteObjectsResult, DownloadedObject, GetObjectBuilder,
-    HeadObjectBuilder, ListObjectsBuilder, MetadataDirective, ObjectBytes, ObjectMetadata,
-    ObjectPage, ObjectSummary, ObjectUploadOptions, PresignedPutObject, PutObjectResult,
+    HeadObjectBuilder, ListObjectsBuilder, MetadataDirective, ObjectBytes, ObjectItem,
+    ObjectMetadata, ObjectPage, ObjectSummary, ObjectUploadOptions, PresignedPutObject,
+    PutObjectResult,
 };
