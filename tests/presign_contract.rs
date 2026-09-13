@@ -51,11 +51,15 @@ async fn presigns_upload_part_without_exposing_secrets_in_debug() {
     assert!(exposed.contains("partNumber=2"));
     assert!(exposed.contains("uploadId=offline-upload-id"));
     assert!(exposed.contains("X-Amz-Signature="));
+    assert_eq!(part.as_str(), exposed);
 
     let debug = format!("{part:?}");
     assert!(!debug.contains("X-Amz-Signature"));
     assert!(!debug.contains("contract-access-key"));
     assert!(!debug.contains("contract-session-token"));
+
+    let expected = exposed.to_string();
+    assert_eq!(part.into_url_string(), expected);
 }
 
 #[tokio::test]

@@ -365,6 +365,18 @@ impl PresignedUploadPart {
         self.request
     }
 
+    /// Returns the bearer presigned URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.request.as_str()
+    }
+
+    /// Consumes the part wrapper and returns the bearer presigned URL as an owned string.
+    #[must_use]
+    pub fn into_url_string(self) -> String {
+        self.request.into_url_string()
+    }
+
     /// Deliberately exposes the bearer request as a serializable protocol DTO.
     ///
     /// The resulting value still redacts its URL and header values from
