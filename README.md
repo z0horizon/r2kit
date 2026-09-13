@@ -12,9 +12,9 @@ account endpoint, `auto` signing region, secret-safe presigned requests,
 resumable multipart sessions, and managed file uploads with bounded concurrency
 and exact retries.
 
-> **Status:** `0.2.0` introduces API simplification, streaming multipart
-> transfers, server-side object copy, Range GET, conditional operations, and
-> account bucket management, verified against live Cloudflare R2.
+> **Status:** `0.3.0` introduces the Unified Transfer Manager with adaptive
+> file uploads, coordinated presigned upload planning, direct multipart abort,
+> and flattened listing streams, verified against live Cloudflare R2.
 
 ## Why r2kit?
 
@@ -129,9 +129,13 @@ invariants.
 | Upload bytes already in memory | `Bucket::put_bytes` |
 | Upload a known-length async body | `Bucket::put_stream` |
 | Download without buffering the whole object | `Bucket::get` |
-| Upload a local file with concurrency and retries | `Bucket::managed_multipart` |
+| Upload a local file with adaptive single/multipart strategy | `Bucket::upload_file` |
+| Upload a local file with explicit multipart options | `Bucket::managed_multipart` |
 | Copy an object without downloading it | `Bucket::copy` |
-| Let a browser or mobile client upload directly | `Bucket::presigned_multipart` |
+| Coordinated presigned upload (single PUT or multipart) | `Bucket::presign_upload` |
+| Direct client multipart upload coordination | `Bucket::presigned_multipart` |
+| Abort an active or orphaned multipart upload directly | `Bucket::abort_multipart_upload` |
+| Stream objects across listing pages | `Bucket::list().into_stream()` |
 | Resume a persisted upload session | `Bucket::resume_managed_multipart` or `resume_presigned_multipart` |
 | Verify bucket existence and list permission at startup | `R2Client::validate_bucket` or `Bucket::validate_access` |
 | Use an S3 operation not wrapped by r2kit | `R2Client::as_sdk` |
@@ -201,10 +205,11 @@ use an extension-based helper such as `mime_guess` when guessing is acceptable.
 
 ## Paginated listings and batch deletion
 
-`send()` intentionally fetches one bounded listing page. Use `into_pages()` to
-follow continuation tokens automatically while preserving page boundaries and
-common prefixes. Stream extension methods require `futures-util` in the
-application.
+`send()` intentionally fetches one bounded listing page. Use `into_stream()`
+(or its alias `into_objects()`) to stream individual objects across all pages
+automatically, or `into_pages()` to follow continuation tokens while preserving
+page boundaries and common prefixes. Stream extension methods require
+`futures-util` in the application.
 
 ```rust,no_run
 use futures_util::TryStreamExt;
@@ -213,6 +218,14 @@ use r2kit::R2Client;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = R2Client::from_env()?.bucket("media")?;
+
+    // Stream individual objects across all pages:
+    let mut stream = std::pin::pin!(bucket.list().prefix("documents/").into_stream());
+    while let Some(object) = stream.try_next().await? {
+        println!("found object: {} ({} bytes)", object.key(), object.size());
+    }
+
+    // Or process bounded pages:
     let pages: Vec<_> = bucket
         .list()
         .prefix("temporary/")
@@ -239,9 +252,10 @@ completed.
 
 ## Managed file uploads
 
-Managed uploads split a local file into R2-compatible parts, upload them in
-parallel, retry transient failures, emit monotonic progress, and complete or
-abort the remote session.
+`bucket.upload_file` provides an adaptive transfer manager that automatically selects
+between a single `PutObject` request (for 0-byte or files below threshold) and a managed
+multipart upload (for larger files) with bounded concurrency, part retry policies, and
+monotonic progress reporting.
 
 ```rust,no_run
 use r2kit::R2Client;
@@ -249,25 +263,39 @@ use r2kit::R2Client;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = R2Client::from_env()?.bucket("media")?;
+
+    // Simplest adaptive upload: selects single PUT (< 8 MiB) or multipart (>= 8 MiB)
+    let result = bucket.upload_file("documents/report.pdf", "report.pdf").await?;
+    println!("uploaded {} bytes (etag: {})", result.size(), result.etag());
+
+    // Or configure custom threshold, concurrency, and progress tracking:
     let result = bucket
-        .managed_multipart("videos/demo.mp4")?
-        .part_size_mib(16)
+        .upload_file("videos/demo.mp4", "demo.mp4")
+        .threshold_mib(16)?
         .concurrency(4)
         .max_attempts(4)
         .on_progress(|progress| {
             eprintln!(
-                "{}/{} bytes",
+                "{}/{} bytes ({:.1}%)",
                 progress.transferred_bytes(),
-                progress.total_bytes()
+                progress.total_bytes(),
+                progress.percentage()
             );
         })
-        .upload_file("videos/demo.mp4")
         .await?;
 
-    eprintln!("completed {} parts", result.part_count());
+    eprintln!("upload strategy used: {:?}", result.strategy());
     Ok(())
 }
 ```
+
+Adaptive file dispatch:
+- **0-byte files:** Dispatched as a single PUT with an empty payload. Avoids multipart overhead and prevents `ValidationError::MultipartFileSizeZero`.
+- **Sub-threshold files:** Streamed via a single PUT with cooperative cancellation support.
+- **Above-threshold files:** Split into R2-compatible parts and uploaded in parallel with bounded concurrency and exact retries.
+
+For advanced low-level multipart workflows, `bucket.managed_multipart` remains available to
+explicitly configure multipart sessions.
 
 The uploader owns the `UploadPart` retry policy. Network failures, HTTP 408,
 429, and 5xx responses are retried with exponential full jitter capped at 30
@@ -315,12 +343,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Dropping the future cannot perform asynchronous cleanup. Signal cancellation
 and keep awaiting it instead.
 
-### Lifecycle policies and cleanup
+### Direct multipart abort and lifecycle cleanup
+
+Downstream applications can directly abort an active or orphaned multipart upload
+without needing a session snapshot or prior knowledge of part sizing:
+
+```rust,no_run
+use r2kit::R2Client;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bucket = R2Client::from_env()?.bucket("media")?;
+
+    // Directly abort an orphaned or cancelled multipart upload
+    bucket.abort_multipart_upload("videos/demo.mp4", "upload-id-here").await?;
+    Ok(())
+}
+```
 
 Cloudflare R2 automatically aborts incomplete multipart uploads seven days
 after initiation by default. Treat that bucket lifecycle rule as a final safety
 net rather than the primary cleanup path: keep awaiting cooperative cancellation
-so r2kit can abort promptly. Verify that the default rule remains enabled, or
+or invoke `abort_multipart_upload` so r2kit can abort promptly. Verify that the default rule remains enabled, or
 configure a shorter interval when abandoned uploads should be reclaimed sooner.
 
 ## Direct browser and mobile uploads
@@ -329,13 +373,51 @@ The trusted server creates a multipart session and signs each part. The
 untrusted uploader receives short-lived bearer URLs but never receives the R2
 access key or secret.
 
+### Coordinated presigned upload plan
+
+When a web or mobile client reports an expected file size, `bucket.presign_upload`
+coordinates whether to generate a single presigned PUT URL (for sub-threshold files)
+or initiate a presigned multipart upload session:
+
+```rust,no_run
+use std::time::Duration;
+use r2kit::{PartNumber, PresignedUploadPlan, R2Client};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bucket = R2Client::from_env()?.bucket("media")?;
+
+    // Automatically coordinates single PUT (< 8 MiB) or multipart (>= 8 MiB)
+    let plan = bucket
+        .presign_upload("uploads/video.mp4", 50 * 1024 * 1024, Duration::from_secs(900))
+        .await?;
+
+    match plan {
+        PresignedUploadPlan::Single(put) => {
+            println!("Single PUT URL: {}", put.as_str());
+        }
+        PresignedUploadPlan::Multipart(multipart) => {
+            println!("Multipart upload ID: {}", multipart.upload_id());
+            println!("Part count: {}", multipart.part_count());
+            let part = multipart
+                .presign_part(PartNumber::try_from(1)?, Duration::from_secs(900))
+                .await?;
+            println!("Part 1 URL: {}", part.request().as_str());
+        }
+    }
+    Ok(())
+}
+```
+
+### Server-controlled multipart protocol
+
 `file_size` is intentionally required for this server-controlled flow. A web
 client sends its `File.size` when requesting a new upload; the server must treat
 that value as untrusted. r2kit validates it before contacting R2, uses it to
 calculate the number of parts and exact final-part length, rejects plans over
 R2's object or 10,000-part limits, and verifies the same plan before completion.
 If the trusted application is uploading a local path instead, use
-`managed_multipart(...).upload_file(path)`: that API reads the size itself.
+`upload_file(key, path)`: that API reads and validates the size itself.
 
 ```text
 trusted server                browser/mobile                    Cloudflare R2
