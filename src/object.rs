@@ -19,7 +19,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
 use crate::{
     Bucket, BucketName, Error, IntoBucketName, IntoContentType, IntoObjectKey, ObjectKey,
-    PresignedRequest, ValidationError,
+    PresignedRequest, UploadFileBuilder, ValidationError,
     multipart::{PresignedMultipartPlan, PresignedUploadPlan},
     types,
 };
@@ -1958,6 +1958,19 @@ impl Bucket {
             });
         }
         Ok(metadata)
+    }
+
+    /// Starts an adaptive file upload that automatically selects between a single PUT
+    /// and managed multipart upload based on file size and configured threshold.
+    ///
+    /// The returned builder supports setting upload options, threshold, concurrency,
+    /// progress callbacks, and cancellation signals.
+    pub fn upload_file(
+        &self,
+        key: impl IntoObjectKey,
+        path: impl AsRef<std::path::Path>,
+    ) -> UploadFileBuilder {
+        UploadFileBuilder::new(self.clone(), key, path)
     }
 
     /// Fetches object metadata without downloading its body.

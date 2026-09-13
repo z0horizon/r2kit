@@ -3,7 +3,7 @@ use std::{
     fmt,
     fs::Metadata,
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU16, AtomicU64, Ordering},
@@ -25,9 +25,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
 use crate::{
-    Bucket, CompletedObject, CompletionManifest, Error, IntoObjectKey, MultipartSessionSnapshot,
-    ObjectUploadOptions, PartNumber, PresignedMultipart, UploadedPart, ValidationError,
-    observability, types,
+    Bucket, CompletedObject, CompletionManifest, Error, IntoContentType, IntoObjectKey,
+    MultipartSessionSnapshot, ObjectKey, ObjectUploadOptions, PartNumber, PresignedMultipart,
+    UploadThreshold, UploadedPart, ValidationError, observability, types,
 };
 
 const DEFAULT_PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -184,6 +184,139 @@ impl ManagedUploadResult {
     }
 }
 
+/// A point-in-time progress update for an adaptive file upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransferProgress {
+    transferred_bytes: u64,
+    total_bytes: u64,
+    is_multipart: bool,
+}
+
+impl TransferProgress {
+    /// Creates a new progress update.
+    #[must_use]
+    pub const fn new(transferred_bytes: u64, total_bytes: u64, is_multipart: bool) -> Self {
+        Self {
+            transferred_bytes,
+            total_bytes,
+            is_multipart,
+        }
+    }
+
+    /// Returns the number of bytes transferred so far.
+    #[must_use]
+    pub const fn transferred_bytes(self) -> u64 {
+        self.transferred_bytes
+    }
+
+    /// Returns the complete file size in bytes.
+    #[must_use]
+    pub const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Returns whether the transfer is executing via multipart upload.
+    #[must_use]
+    pub const fn is_multipart(self) -> bool {
+        self.is_multipart
+    }
+
+    /// Returns the completed fraction in the inclusive range `0.0..=1.0`.
+    ///
+    /// For 0-byte files, returns `1.0`.
+    #[must_use]
+    pub fn fraction(self) -> f64 {
+        if self.total_bytes == 0 {
+            1.0
+        } else {
+            (self.transferred_bytes as f64 / self.total_bytes as f64).min(1.0)
+        }
+    }
+
+    /// Returns the completed percentage in the inclusive range `0.0..=100.0`.
+    #[must_use]
+    pub fn percentage(self) -> f64 {
+        self.fraction() * 100.0
+    }
+}
+
+/// The upload strategy selected for an adaptive file transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferStrategyUsed {
+    /// Transfer was performed using a single-part `PutObject` request.
+    SinglePut,
+    /// Transfer was performed using a coordinated multipart upload pipeline.
+    Multipart {
+        /// Number of parts into which the file was partitioned.
+        part_count: u16,
+    },
+}
+
+impl TransferStrategyUsed {
+    /// Returns `true` if multipart upload was used.
+    #[must_use]
+    pub const fn is_multipart(self) -> bool {
+        matches!(self, Self::Multipart { .. })
+    }
+
+    /// Returns `true` if single-part PUT was used.
+    #[must_use]
+    pub const fn is_single_put(self) -> bool {
+        matches!(self, Self::SinglePut)
+    }
+}
+
+/// Successful outcome of an adaptive file upload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferResult {
+    key: ObjectKey,
+    etag: String,
+    size: u64,
+    strategy: TransferStrategyUsed,
+}
+
+impl TransferResult {
+    /// Creates a new transfer result.
+    #[must_use]
+    pub const fn new(
+        key: ObjectKey,
+        etag: String,
+        size: u64,
+        strategy: TransferStrategyUsed,
+    ) -> Self {
+        Self {
+            key,
+            etag,
+            size,
+            strategy,
+        }
+    }
+
+    /// Returns metadata identifying the target object.
+    #[must_use]
+    pub const fn key(&self) -> &ObjectKey {
+        &self.key
+    }
+
+    /// Returns the ETag of the completed object reported by R2.
+    #[must_use]
+    pub fn etag(&self) -> &str {
+        &self.etag
+    }
+
+    /// Returns the uploaded file size in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Returns the transfer strategy used for this upload.
+    #[must_use]
+    pub const fn strategy(&self) -> TransferStrategyUsed {
+        self.strategy
+    }
+}
+
 /// Failure from a managed upload, including recoverable session state.
 pub struct ManagedUploadError {
     error: Error,
@@ -230,6 +363,12 @@ impl fmt::Display for ManagedUploadError {
 impl std::error::Error for ManagedUploadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
+    }
+}
+
+impl From<ManagedUploadError> for Error {
+    fn from(value: ManagedUploadError) -> Self {
+        value.error
     }
 }
 
@@ -928,6 +1067,362 @@ impl Bucket {
     }
 }
 
+type TransferProgressCallback = Arc<dyn Fn(TransferProgress) + Send + Sync>;
+
+/// Configures an adaptive file upload that automatically selects between a single PUT
+/// and managed multipart upload based on file size and configured threshold.
+pub struct UploadFileBuilder {
+    bucket: Bucket,
+    key: Result<ObjectKey, Error>,
+    path: PathBuf,
+    options: ObjectUploadOptions,
+    threshold: UploadThreshold,
+    part_size: u64,
+    concurrency: usize,
+    max_attempts: u8,
+    max_buffered_bytes: u64,
+    cancellation: Option<ManagedUploadCancellation>,
+    progress: Option<TransferProgressCallback>,
+}
+
+impl fmt::Debug for UploadFileBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UploadFileBuilder")
+            .field("bucket", &self.bucket)
+            .field("key", &self.key)
+            .field("path", &self.path)
+            .field("options", &self.options)
+            .field("threshold", &self.threshold)
+            .field("part_size", &self.part_size)
+            .field("concurrency", &self.concurrency)
+            .field("max_attempts", &self.max_attempts)
+            .field("max_buffered_bytes", &self.max_buffered_bytes)
+            .field("cancellation", &self.cancellation.is_some())
+            .field("progress", &self.progress.as_ref().map(|_| "callback"))
+            .finish()
+    }
+}
+
+impl UploadFileBuilder {
+    /// Creates a new adaptive upload builder.
+    pub fn new(bucket: Bucket, key: impl IntoObjectKey, path: impl AsRef<Path>) -> Self {
+        Self {
+            bucket,
+            key: key.into_object_key(),
+            path: path.as_ref().to_path_buf(),
+            options: ObjectUploadOptions::default(),
+            threshold: UploadThreshold::default(),
+            part_size: DEFAULT_PART_SIZE,
+            concurrency: DEFAULT_CONCURRENCY,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
+            cancellation: None,
+            progress: None,
+        }
+    }
+
+    /// Sets typed upload options stored on the completed object.
+    #[must_use]
+    pub fn options(mut self, options: ObjectUploadOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Sets typed upload options (alias for [`Self::options`]).
+    #[must_use]
+    pub fn upload_options(self, options: ObjectUploadOptions) -> Self {
+        self.options(options)
+    }
+
+    /// Sets the completed object's MIME media type.
+    #[must_use]
+    pub fn content_type(mut self, value: impl IntoContentType) -> Self {
+        self.options = self.options.with_content_type(value);
+        self
+    }
+
+    /// Sets the completed object's typed HTTP cache policy.
+    #[must_use]
+    pub fn cache_control(mut self, value: headers::CacheControl) -> Self {
+        self.options = self.options.with_cache_control(value);
+        self
+    }
+
+    /// Sets the upload threshold separating single-part PUT from multipart upload.
+    #[must_use]
+    pub fn threshold(mut self, threshold: UploadThreshold) -> Self {
+        self.threshold = threshold;
+        self
+    }
+
+    /// Sets the upload threshold in bytes.
+    pub fn threshold_bytes(mut self, bytes: u64) -> Result<Self, ValidationError> {
+        self.threshold = UploadThreshold::new(bytes)?;
+        Ok(self)
+    }
+
+    /// Sets the upload threshold in mebibytes (MiB).
+    pub fn threshold_mib(mut self, mebibytes: u64) -> Result<Self, ValidationError> {
+        self.threshold = UploadThreshold::new(types::mebibytes(mebibytes))?;
+        Ok(self)
+    }
+
+    /// Sets the multipart part size in bytes (when multipart upload is selected).
+    #[must_use]
+    pub const fn part_size(mut self, bytes: u64) -> Self {
+        self.part_size = bytes;
+        self
+    }
+
+    /// Sets the multipart part size in mebibytes (MiB).
+    #[must_use]
+    pub const fn part_size_mib(mut self, mebibytes: u64) -> Self {
+        self.part_size = types::mebibytes(mebibytes);
+        self
+    }
+
+    /// Sets the maximum number of in-flight parts, from 1 through 64.
+    #[must_use]
+    pub const fn concurrency(mut self, value: usize) -> Self {
+        self.concurrency = value;
+        self
+    }
+
+    /// Sets total attempts per part, from 1 through 10.
+    #[must_use]
+    pub const fn max_attempts(mut self, value: u8) -> Self {
+        self.max_attempts = value;
+        self
+    }
+
+    /// Sets the maximum memory used by in-flight part buffers in bytes.
+    #[must_use]
+    pub const fn max_buffered_bytes(mut self, value: u64) -> Self {
+        self.max_buffered_bytes = value;
+        self
+    }
+
+    /// Sets the maximum memory used by in-flight part buffers in MiB.
+    #[must_use]
+    pub const fn max_buffered_mib(mut self, mebibytes: u64) -> Self {
+        self.max_buffered_bytes = types::mebibytes(mebibytes);
+        self
+    }
+
+    /// Registers an explicit cooperative cancellation signal.
+    #[must_use]
+    pub fn cancellation_token(mut self, cancellation: ManagedUploadCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Registers a progress callback invoked after transfer progress changes.
+    #[must_use]
+    pub fn on_progress(
+        mut self,
+        callback: impl Fn(TransferProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress = Some(Arc::new(callback));
+        self
+    }
+
+    /// Executes the adaptive file upload.
+    pub async fn send(self) -> Result<TransferResult, Error> {
+        let key = self.key.clone()?;
+
+        if self.concurrency == 0 || self.concurrency > MAX_CONCURRENCY {
+            return Err(ValidationError::ConcurrencyOutOfRange {
+                provided: self.concurrency,
+                min: 1,
+                max: MAX_CONCURRENCY,
+            }
+            .into());
+        }
+        if self.max_attempts == 0 || self.max_attempts > MAX_ATTEMPTS {
+            return Err(ValidationError::AttemptsOutOfRange {
+                provided: self.max_attempts,
+                min: 1,
+                max: MAX_ATTEMPTS,
+            }
+            .into());
+        }
+
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(ManagedUploadCancellation::is_cancelled)
+        {
+            return Err(Error::Cancelled);
+        }
+
+        let metadata = tokio::fs::metadata(&self.path)
+            .await
+            .map_err(|_| Error::Io {
+                operation: "metadata",
+            })?;
+        if !metadata.is_file() {
+            return Err(Error::InvalidInput {
+                field: "path",
+                reason: "must identify a regular file",
+            });
+        }
+        let file_size = metadata.len();
+        let source_fingerprint = SourceFileFingerprint::from_metadata(&metadata);
+
+        if file_size == 0 {
+            self.options.validate()?;
+            observability::managed_upload("start", 0, 1, 1);
+            let put_fut =
+                self.bucket
+                    .put_bytes_with_options(&key, Vec::new(), self.options.clone());
+
+            let put_res = match self.cancellation.as_ref() {
+                Some(cancellation) => {
+                    let put_fut = std::pin::pin!(put_fut);
+                    let cancelled = std::pin::pin!(cancellation.cancelled());
+                    match select(put_fut, cancelled).await {
+                        Either::Left((res, _)) => res?,
+                        Either::Right(((), _)) => return Err(Error::Cancelled),
+                    }
+                }
+                None => put_fut.await?,
+            };
+
+            let final_metadata = tokio::fs::metadata(&self.path)
+                .await
+                .map_err(|_| Error::Io {
+                    operation: "metadata",
+                })?;
+            if !source_fingerprint.matches(&final_metadata) {
+                return Err(Error::InvalidInput {
+                    field: "path",
+                    reason: "file changed during upload",
+                });
+            }
+
+            if let Some(ref callback) = self.progress {
+                callback(TransferProgress {
+                    transferred_bytes: 0,
+                    total_bytes: 0,
+                    is_multipart: false,
+                });
+            }
+
+            observability::managed_upload("complete", 0, 1, 1);
+            return Ok(TransferResult {
+                key,
+                etag: put_res.etag().unwrap_or_default().to_string(),
+                size: 0,
+                strategy: TransferStrategyUsed::SinglePut,
+            });
+        }
+
+        if file_size < self.threshold.get() {
+            self.options.validate()?;
+            observability::managed_upload("start", file_size, 1, 1);
+            let file = tokio::fs::File::open(&self.path)
+                .await
+                .map_err(|_| Error::Io { operation: "open" })?;
+            let body = ByteStream::read_from()
+                .file(file)
+                .length(aws_smithy_types::byte_stream::Length::Exact(file_size))
+                .buffer_size(64 * 1024)
+                .build()
+                .await
+                .map_err(|_| Error::Io { operation: "open" })?;
+
+            let put_fut =
+                self.bucket
+                    .put_stream_with_options(&key, body, file_size, self.options.clone());
+
+            let put_res = match self.cancellation.as_ref() {
+                Some(cancellation) => {
+                    let put_fut = std::pin::pin!(put_fut);
+                    let cancelled = std::pin::pin!(cancellation.cancelled());
+                    match select(put_fut, cancelled).await {
+                        Either::Left((res, _)) => res?,
+                        Either::Right(((), _)) => return Err(Error::Cancelled),
+                    }
+                }
+                None => put_fut.await?,
+            };
+
+            let final_metadata = tokio::fs::metadata(&self.path)
+                .await
+                .map_err(|_| Error::Io {
+                    operation: "metadata",
+                })?;
+            if !source_fingerprint.matches(&final_metadata) {
+                return Err(Error::InvalidInput {
+                    field: "path",
+                    reason: "file changed during upload",
+                });
+            }
+
+            if let Some(ref callback) = self.progress {
+                callback(TransferProgress {
+                    transferred_bytes: file_size,
+                    total_bytes: file_size,
+                    is_multipart: false,
+                });
+            }
+
+            observability::managed_upload("complete", file_size, 1, 1);
+            return Ok(TransferResult {
+                key,
+                etag: put_res.etag().unwrap_or_default().to_string(),
+                size: file_size,
+                strategy: TransferStrategyUsed::SinglePut,
+            });
+        }
+
+        let mut mp_builder = self.bucket.managed_multipart(&key)?;
+        mp_builder = mp_builder
+            .upload_options(self.options.clone())
+            .part_size(self.part_size)
+            .concurrency(self.concurrency)
+            .max_attempts(self.max_attempts)
+            .max_buffered_bytes(self.max_buffered_bytes);
+
+        if let Some(cancellation) = self.cancellation {
+            mp_builder = mp_builder.cancellation_token(cancellation);
+        }
+
+        if let Some(progress) = self.progress {
+            mp_builder = mp_builder.on_progress(move |mp| {
+                progress(TransferProgress {
+                    transferred_bytes: mp.transferred_bytes(),
+                    total_bytes: mp.total_bytes(),
+                    is_multipart: true,
+                });
+            });
+        }
+
+        let managed_res = mp_builder
+            .upload_file(&self.path)
+            .await
+            .map_err(|err| err.error)?;
+
+        Ok(TransferResult {
+            key,
+            etag: managed_res.object().etag().unwrap_or_default().to_string(),
+            size: managed_res.file_size(),
+            strategy: TransferStrategyUsed::Multipart {
+                part_count: managed_res.part_count(),
+            },
+        })
+    }
+}
+
+impl std::future::IntoFuture for UploadFileBuilder {
+    type Output = Result<TransferResult, Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.send())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceFileFingerprint {
     len: u64,
@@ -1393,5 +1888,45 @@ mod tests {
 
         assert_eq!(progress.fraction(), 0.0);
         assert_eq!(progress.percentage(), 0.0);
+    }
+
+    #[test]
+    fn transfer_progress_reports_fraction_and_percentage() {
+        let progress = TransferProgress::new(25, 100, false);
+        assert_eq!(progress.transferred_bytes(), 25);
+        assert_eq!(progress.total_bytes(), 100);
+        assert!(!progress.is_multipart());
+        assert_eq!(progress.fraction(), 0.25);
+        assert_eq!(progress.percentage(), 25.0);
+
+        let empty = TransferProgress::new(0, 0, false);
+        assert_eq!(empty.fraction(), 1.0);
+        assert_eq!(empty.percentage(), 100.0);
+    }
+
+    #[test]
+    fn transfer_strategy_helpers() {
+        let single = TransferStrategyUsed::SinglePut;
+        assert!(single.is_single_put());
+        assert!(!single.is_multipart());
+
+        let multi = TransferStrategyUsed::Multipart { part_count: 5 };
+        assert!(!multi.is_single_put());
+        assert!(multi.is_multipart());
+    }
+
+    #[test]
+    fn transfer_result_accessors() {
+        let key = ObjectKey::new("test.bin").unwrap();
+        let result = TransferResult::new(
+            key.clone(),
+            "\"etag-123\"".to_string(),
+            1024,
+            TransferStrategyUsed::SinglePut,
+        );
+        assert_eq!(result.key(), &key);
+        assert_eq!(result.etag(), "\"etag-123\"");
+        assert_eq!(result.size(), 1024);
+        assert_eq!(result.strategy(), TransferStrategyUsed::SinglePut);
     }
 }

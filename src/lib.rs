@@ -21,7 +21,7 @@ pub use error::{ConfigError, Error, ServiceError, ServiceErrorKind, ValidationEr
 pub use headers::CacheControl;
 pub use managed::{
     ManagedMultipartBuilder, ManagedUploadCancellation, ManagedUploadError, ManagedUploadProgress,
-    ManagedUploadResult,
+    ManagedUploadResult, TransferProgress, TransferResult, TransferStrategyUsed, UploadFileBuilder,
 };
 pub use mime::{self, Mime};
 pub use multipart::{
